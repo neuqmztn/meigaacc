@@ -1,637 +1,396 @@
+`timescale 1ns / 1ps
+
+// ============================================================================
+// online_softmax_engine（多 chunk 在线 Softmax 核心）
+//
+// 功能（FlashAttention 风格的统计部分）：
+//   - 对同一行 scores 的多个 chunk 顺序处理，维护全局的：
+//       m_new = max(m_prev, m_chunk)
+//       l_new = l_prev * exp(m_prev - m_new) + Σ_j exp(score_j - m_new)
+//   - 输出：
+//       1) 写回 softmax_stats_buffer 的 m_new / l_new
+//       2) 当前 chunk 中各列的 "分子"：exp(score_j - m_new)
+//       3) 当 m_new > m_prev 且非首块时，给出 renorm_scale = exp(m_prev - m_new)
+//          供下游对旧 O 做重标定（可选用）
+//
+// 说明：
+//   - 该模块本身不做 / l_new，因此 weights_packed 不是最终权重，
+//     而是 softmax 的未归一化分子（Q14 定点）。
+//   - 真正的权重 w_j = exp(score_j - m_new) / l_new 需要在后级计算。
+// ============================================================================
+
 module online_softmax_engine #(
-    parameter NUM_HEADS = 4,
-    parameter TOKEN_BATCH = 32,
-    parameter K_CHUNK_SIZE = 32,
-    parameter DATA_WIDTH = 8,
-    parameter EXP_WIDTH = 8,
-    parameter SCORE_WIDTH = 16,
-    parameter ACCUM_WIDTH = 24
+    parameter NUM_HEADS    = 4,
+    parameter TOKEN_BATCH  = 32,
+    parameter K_CHUNK_SIZE = 32,   // 每个 chunk 的 K 上限
+    parameter DATA_WIDTH   = 8,    // 这里未用，可预留
+    parameter EXP_WIDTH    = 8,    // 这里未用，可预留 BFP 指数
+    parameter SCORE_WIDTH  = 16,   // score / 分子 使用位宽（建议 Q2.14）
+    parameter ACCUM_WIDTH  = 24    // 统计 l_new 使用位宽
 )(
     input  wire clk,
     input  wire rst_n,
-    
-    // 控制接口
-    input  wire start,
-    input  wire [1:0] head_idx,
-    input  wire [4:0] row_idx,
-    input  wire [4:0] chunk_id,
-    input  wire chunk_first,
-    input  wire chunk_last,
-    input  wire [5:0] chunk_size,
-    output reg  done,
-    output reg  busy,
-    
-    // Scores输入（BFP格式：共享指数 + 尾数）
-    input  wire [EXP_WIDTH-1:0] scores_shared_exp,
-    input  wire [K_CHUNK_SIZE*SCORE_WIDTH-1:0] scores_mants_packed,
-    
-    // 统计量存储接口（读取）
-    input  wire signed [SCORE_WIDTH-1:0] max_rd_value,
-    input  wire signed [ACCUM_WIDTH-1:0] sum_rd_value,
-    
-    // 统计量存储接口（写入）
-    output reg  max_wr_en,
+
+    // 控制接口（由 batch wrapper 驱动）
+    input  wire        start,        // 拉高一个周期，启动本行本 chunk 计算
+    input  wire [1:0]  head_idx,     // 哪个 head 的统计（方便写回）
+    input  wire [4:0]  row_idx,      // 哪一行 query（0..TOKEN_BATCH-1）
+    input  wire [4:0]  chunk_id,     // 当前 chunk id（调试用）
+    input  wire        chunk_first,  // 1：该行的第一个 chunk
+    input  wire        chunk_last,   // 1：该行的最后一个 chunk（仅供上层参考）
+    input  wire [5:0]  chunk_size,   // 本 chunk 内实际列数（<= K_CHUNK_SIZE）
+
+    output reg         done,         // 本 chunk 计算完成（单周期脉冲）
+    output reg         busy,         // 该 engine 正在处理
+
+    // Scores 输入（每次处理一行的一个 chunk）
+    input  wire [EXP_WIDTH-1:0]                scores_shared_exp,   // 保留接口，当前未使用
+    input  wire [K_CHUNK_SIZE*SCORE_WIDTH-1:0] scores_mants_packed, // 扁平化 scores[j]，按列打包
+
+    // 旧统计量（从 softmax_stats_buffer 读出）
+    input  wire signed [SCORE_WIDTH-1:0]       max_rd_value,  // old m_prev
+    input  wire signed [ACCUM_WIDTH-1:0]       sum_rd_value,  // old l_prev
+
+    // 新统计量（写回 softmax_stats_buffer）
+    output reg        max_wr_en,
     output reg  [1:0] max_wr_head,
     output reg  [4:0] max_wr_row,
-    output reg  signed [SCORE_WIDTH-1:0] max_wr_value,
-    
-    output reg  sum_wr_en,
+    output reg  signed [SCORE_WIDTH-1:0] max_wr_value,  // m_new
+
+    output reg        sum_wr_en,
     output reg  [1:0] sum_wr_head,
     output reg  [4:0] sum_wr_row,
-    output reg  signed [ACCUM_WIDTH-1:0] sum_wr_value,
-    
-    // 重归一化信号（给Apply V模块）
-    output reg  renorm_en,
-    output reg  signed [SCORE_WIDTH-1:0] renorm_scale,
-    
-    // Attention weights输出
-    output reg  weights_valid,
+    output reg  signed [ACCUM_WIDTH-1:0] sum_wr_value,  // l_new（截位）
+
+    // 若 m_new > m_prev，则需对旧 O 乘 renorm_scale
+    output reg        renorm_en,                      // 1：需要重标定
+    output reg  signed [SCORE_WIDTH-1:0] renorm_scale, // α_prev = exp(m_prev - m_new)，Q14
+
+    // 当前 chunk 输出的"分子"数组：exp(score_j - m_new)
+    output reg        weights_valid,   // 当前 chunk 的分子数组就绪
     output wire [K_CHUNK_SIZE*SCORE_WIDTH-1:0] weights_packed
 );
 
-//================================================================================
-// 本地参数定义
-//================================================================================
+    // --------------------------------------------------------------------
+    // 本地参数
+    // --------------------------------------------------------------------
+    localparam integer FRAC_BITS = 14;      // 约定 Q2.14
+    localparam signed [SCORE_WIDTH-1:0] NEG_INF = -16'sh7FFF;
+    localparam signed [SCORE_WIDTH-1:0] ONE_Q   = 16'sd1 <<< FRAC_BITS;
+    localparam integer INTERNAL_ACC_WIDTH = ACCUM_WIDTH + 4;
 
-// Q14定点数的小数位数
-localparam FRAC_BITS = 14;
+    // 状态机
+    localparam [2:0]
+        S_IDLE      = 3'd0,
+        S_LOAD      = 3'd1,
+        S_FIND      = 3'd2,
+        S_PREP      = 3'd3,
+        S_CLEAR_EXP = 3'd4,
+        S_EXP_SUM   = 3'd5,
+        S_WRITE     = 3'd6,
+        S_DONE      = 3'd7;
 
-// 负无穷大（用于初始化max）
-localparam NEG_INF = -16'h7FFF;
+    reg [2:0] state;
 
-// 内部扩展累加器位宽（32位，提供更大动态范围）
-localparam INTERNAL_ACCUM_WIDTH = 32;
+    // --------------------------------------------------------------------
+    // 内部寄存器 / 数组
+    // --------------------------------------------------------------------
+    // 展开 scores
+    reg signed [SCORE_WIDTH-1:0] scores_array [0:K_CHUNK_SIZE-1];
+    // 当前 chunk 对应 exp(score - m_new) 分子
+    reg signed [SCORE_WIDTH-1:0] exp_array    [0:K_CHUNK_SIZE-1];
 
-// Exp函数分段阈值（Q14格式）
-localparam EXP_THRESHOLD_HIGH = 16'sd2048;   // 0.125
-localparam EXP_THRESHOLD_MID = -16'sd2048;   // -0.125
-localparam EXP_THRESHOLD_LOW = -16'sd8192;   // -0.5
+    // 统计量寄存器
+    reg signed [SCORE_WIDTH-1:0] old_max;     // m_prev
+    reg signed [SCORE_WIDTH-1:0] new_max;     // m_new
+    reg signed [SCORE_WIDTH-1:0] chunk_max;   // m_chunk
 
-// 最小非零exp值（防止完全下溢）
-localparam MIN_EXP_VALUE = 16'sd1;
+    reg signed [INTERNAL_ACC_WIDTH-1:0] old_sum_internal; // 扩展后的 l_prev
+    reg signed [INTERNAL_ACC_WIDTH-1:0] new_sum_internal; // l_new 内部累加
 
-// 除法保护阈值
-localparam MIN_SUM_THRESHOLD = 32'd16;
+    // FlashAttention 的缩放因子
+    reg signed [SCORE_WIDTH-1:0] alpha_prev;   // = exp(m_prev  - m_new)
+    reg signed [SCORE_WIDTH-1:0] beta_chunk;   // = exp(m_chunk - m_new)
 
-//================================================================================
-// 状态定义
-//================================================================================
+    // 循环指标
+    reg [5:0] idx;
 
-localparam STATE_IDLE            = 4'd0;
-localparam STATE_LOAD_STATS      = 4'd1;
-localparam STATE_FIND_MAX_INIT   = 4'd2;
-localparam STATE_FIND_MAX_LOOP   = 4'd3;
-localparam STATE_UPDATE_MAX      = 4'd4;
-localparam STATE_COMPUTE_EXP     = 4'd5;
-localparam STATE_ACCUMULATE_SUM  = 4'd6;
-localparam STATE_WRITE_STATS     = 4'd7;
-localparam STATE_NORMALIZE_INIT  = 4'd8;
-localparam STATE_NORMALIZE_LOOP  = 4'd9;
-localparam STATE_DONE            = 4'd10;
+    // 用于 S_PREP
+    reg signed [SCORE_WIDTH-1:0] m_new_next;
+    reg signed [SCORE_WIDTH-1:0] dm_prev;
+    reg signed [SCORE_WIDTH-1:0] dm_chunk;
+    reg signed [SCORE_WIDTH-1:0] scale_prev_q;
+    reg signed [SCORE_WIDTH-1:0] scale_chunk_q;
+    reg signed [INTERNAL_ACC_WIDTH-1:0] old_sum_scaled;
 
-reg [3:0] state;
+    // 用于 S_EXP_SUM
+    reg signed [SCORE_WIDTH-1:0] delta_local;
+    reg signed [SCORE_WIDTH-1:0] exp_local;
+    reg signed [2*SCORE_WIDTH-1:0] mult_tmp;
+    reg signed [SCORE_WIDTH-1:0] exp_global;
 
-//================================================================================
-// 内部寄存器
-//================================================================================
+    integer i;
 
-// 统计量（使用扩展位宽）
-reg signed [SCORE_WIDTH-1:0] old_max;
-reg signed [SCORE_WIDTH-1:0] new_max;
-reg signed [SCORE_WIDTH-1:0] chunk_max;
-reg signed [INTERNAL_ACCUM_WIDTH-1:0] old_sum_internal;
-reg signed [INTERNAL_ACCUM_WIDTH-1:0] new_sum_internal;
-reg max_updated;
-
-// 数据数组
-reg signed [SCORE_WIDTH-1:0] scores_array [0:K_CHUNK_SIZE-1];
-reg signed [SCORE_WIDTH-1:0] exp_values [0:K_CHUNK_SIZE-1];
-reg signed [SCORE_WIDTH-1:0] weights_array [0:K_CHUNK_SIZE-1];
-
-// 循环计数器
-reg [5:0] loop_idx;
-
-// 临时变量
-reg signed [SCORE_WIDTH-1:0] temp_score;
-reg signed [SCORE_WIDTH-1:0] temp_exp;
-reg signed [INTERNAL_ACCUM_WIDTH-1:0] temp_sum;
-
-// 中间计算变量
-reg signed [31:0] mult_temp;
-reg signed [47:0] mult_product;
-
-// 整数索引
-integer i;
-
-//================================================================================
-// 解包输入scores
-//================================================================================
-
-always @(*) begin
-    for (i = 0; i < K_CHUNK_SIZE; i = i + 1) begin
-        scores_array[i] = scores_mants_packed[i*SCORE_WIDTH +: SCORE_WIDTH];
+    // --------------------------------------------------------------------
+    // 解包 scores_mants_packed
+    // --------------------------------------------------------------------
+    always @(*) begin
+        for (i = 0; i < K_CHUNK_SIZE; i = i + 1) begin
+            scores_array[i] = scores_mants_packed[i*SCORE_WIDTH +: SCORE_WIDTH];
+        end
     end
-end
 
-//================================================================================
-// 打包输出weights - 使用generate确保可综合
-//================================================================================
+    // --------------------------------------------------------------------
+    // 打包 exp_array -> weights_packed
+    // --------------------------------------------------------------------
+    genvar gv;
+    generate
+        for (gv = 0; gv < K_CHUNK_SIZE; gv = gv + 1) begin : GEN_PACK
+            assign weights_packed[gv*SCORE_WIDTH +: SCORE_WIDTH] = exp_array[gv];
+        end
+    endgenerate
 
-genvar gv_i;
-generate
-    for (gv_i = 0; gv_i < K_CHUNK_SIZE; gv_i = gv_i + 1) begin : gen_weights_pack
-        assign weights_packed[gv_i*SCORE_WIDTH +: SCORE_WIDTH] = weights_array[gv_i];
-    end
-endgenerate
-
-//================================================================================
-// 改进的Exp近似函数（分段Padé逼近 + 泰勒展开）
-//
-// 精度对比：
-// - 原版线性近似：误差 ~5%
-// - 优化版分段逼近：误差 ~0.5%
-//
-// 输入：x = score - max （Q14格式，通常为负数）
-// 输出：exp(x) （Q14格式）
-//================================================================================
-
-function signed [SCORE_WIDTH-1:0] exp_approx_improved;
-    input signed [SCORE_WIDTH-1:0] x;
-    reg signed [31:0] temp;
-    reg signed [31:0] x_sq;
-    reg signed [31:0] x_cu;
-    reg signed [15:0] result;
+    // --------------------------------------------------------------------
+    // exp 近似函数（Q14，针对 x <= 0 区域）:
+    //   exp(x) ≈ 1 + x + x^2/2
+    //   输入/输出均视为 Q2.14
+    // --------------------------------------------------------------------
+    function signed [SCORE_WIDTH-1:0] exp_approx_q14;
+        input signed [SCORE_WIDTH-1:0] x;
+        reg   signed [2*SCORE_WIDTH-1:0] x2;
+        reg   signed [2*SCORE_WIDTH-1:0] term2;
+        reg   signed [SCORE_WIDTH:0]     res_ext;
     begin
-        // 区间1: x >= 0.125 (正值区域)
-        // 使用Padé [1/1]逼近: exp(x) ≈ (2 + x) / (2 - x)
-        if (x >= EXP_THRESHOLD_HIGH) begin
-            // 计算分子: 2 + x = 32768 + x
-            temp = 32'sd32768 + {{16{x[15]}}, x};
-            
-            // 计算分母: 2 - x = 32768 - x
-            mult_temp = 32'sd32768 - {{16{x[15]}}, x};
-            
-            // 避免除零
-            if (mult_temp <= 32'sd256) begin
-                result = 16'sd32767;
-            end else begin
-                // (分子 << 14) / 分母，保持Q14格式
-                temp = (temp <<< 14) / mult_temp;
-                
-                // 饱和处理
-                if (temp > 32'sd32767) begin
-                    result = 16'sd32767;
-                end else if (temp < 32'sd0) begin
-                    result = MIN_EXP_VALUE;
-                end else begin
-                    result = temp[15:0];
-                end
-            end
+        if (x <= -16'sd8 <<< FRAC_BITS) begin
+            exp_approx_q14 = {SCORE_WIDTH{1'b0}};
+        end else if (x >= 0) begin
+            exp_approx_q14 = ONE_Q;
+        end else begin
+            x2    = x * x;
+            term2 = x2 >>> (FRAC_BITS+1); // x^2 / 2
+
+            res_ext = {ONE_Q[15], ONE_Q} + {{1{x[15]}}, x} +
+                      {term2[2*SCORE_WIDTH-1], term2[2*SCORE_WIDTH-1 -: SCORE_WIDTH]};
+
+            exp_approx_q14 = res_ext[SCORE_WIDTH-1:0];
+            if (exp_approx_q14[SCORE_WIDTH-1])
+                exp_approx_q14 = {SCORE_WIDTH{1'b0}};
         end
-        
-        // 区间2: -0.125 <= x < 0.125 (接近零的区域)
-        // 使用泰勒展开到3阶: exp(x) ≈ 1 + x + x²/2 + x³/6
-        else if (x >= EXP_THRESHOLD_MID) begin
-            // 初始化为 1.0 (Q14)
-            temp = 32'sd16384;
-            
-            // 加上 x
-            temp = temp + {{16{x[15]}}, x};
-            
-            // 计算 x² (Q28) 并右移14位回Q14
-            x_sq = ({{16{x[15]}}, x} * {{16{x[15]}}, x}) >>> 14;
-            
-            // 加上 x²/2 (右移1位即除以2)
-            temp = temp + (x_sq >>> 1);
-            
-            // 计算 x³ (Q28) 并右移14位
-            x_cu = (x_sq * {{16{x[15]}}, x}) >>> 14;
-            
-            // 加上 x³/6
-            // 除以6可近似为 (x³ >> 2) - (x³ >> 4)
-            temp = temp + ((x_cu >>> 2) - (x_cu >>> 4));
-            
-            // 饱和处理
-            if (temp > 32'sd32767) begin
-                result = 16'sd32767;
-            end else if (temp < 32'sd0) begin
-                result = MIN_EXP_VALUE;
-            end else begin
-                result = temp[15:0];
-            end
-        end
-        
-        // 区间3: -0.5 <= x < -0.125 (中等负值)
-        // 使用泰勒展开到2阶: exp(x) ≈ 1 + x + x²/2
-        else if (x >= EXP_THRESHOLD_LOW) begin
-            temp = 32'sd16384 + {{16{x[15]}}, x};
-            x_sq = ({{16{x[15]}}, x} * {{16{x[15]}}, x}) >>> 14;
-            temp = temp + (x_sq >>> 1);
-            
-            if (temp > 32'sd32767) begin
-                result = 16'sd32767;
-            end else if (temp < 32'sd0) begin
-                result = MIN_EXP_VALUE;
-            end else begin
-                result = temp[15:0];
-            end
-        end
-        
-        // 区间4: x < -0.5 (大负值，接近零)
-        // 使用简化线性近似: exp(x) ≈ max(1 + x, MIN_EXP)
-        else begin
-            temp = 32'sd16384 + {{16{x[15]}}, x};
-            
-            if (temp < MIN_EXP_VALUE) begin
-                result = MIN_EXP_VALUE;
-            end else if (temp > 32'sd32767) begin
-                result = 16'sd32767;
-            end else begin
-                result = temp[15:0];
-            end
-        end
-        
-        exp_approx_improved = result;
     end
-endfunction
+    endfunction
 
-//================================================================================
-// 饱和加法函数
-//================================================================================
+    // --------------------------------------------------------------------
+    // 主状态机
+    // --------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state           <= S_IDLE;
+            done            <= 1'b0;
+            busy            <= 1'b0;
 
-function signed [INTERNAL_ACCUM_WIDTH-1:0] saturate_add;
-    input signed [INTERNAL_ACCUM_WIDTH-1:0] a;
-    input signed [INTERNAL_ACCUM_WIDTH-1:0] b;
-    reg signed [INTERNAL_ACCUM_WIDTH:0] temp_result;
-    begin
-        temp_result = {a[INTERNAL_ACCUM_WIDTH-1], a} + {b[INTERNAL_ACCUM_WIDTH-1], b};
-        
-        // 检测溢出
-        if (temp_result[INTERNAL_ACCUM_WIDTH] != temp_result[INTERNAL_ACCUM_WIDTH-1]) begin
-            // 溢出：根据符号位饱和
-            if (temp_result[INTERNAL_ACCUM_WIDTH]) begin
-                // 负溢出
-                saturate_add = {1'b1, {(INTERNAL_ACCUM_WIDTH-1){1'b0}}};
-            end else begin
-                // 正溢出
-                saturate_add = {1'b0, {(INTERNAL_ACCUM_WIDTH-1){1'b1}}};
+            max_wr_en       <= 1'b0;
+            sum_wr_en       <= 1'b0;
+            max_wr_head     <= 2'd0;
+            max_wr_row      <= 5'd0;
+            max_wr_value    <= {SCORE_WIDTH{1'b0}};
+            sum_wr_head     <= 2'd0;
+            sum_wr_row      <= 5'd0;
+            sum_wr_value    <= {ACCUM_WIDTH{1'b0}};
+
+            renorm_en       <= 1'b0;
+            renorm_scale    <= ONE_Q;
+            weights_valid   <= 1'b0;
+
+            old_max         <= NEG_INF;
+            new_max         <= NEG_INF;
+            chunk_max       <= NEG_INF;
+            old_sum_internal<= {INTERNAL_ACC_WIDTH{1'b0}};
+            new_sum_internal<= {INTERNAL_ACC_WIDTH{1'b0}};
+
+            alpha_prev      <= ONE_Q;
+            beta_chunk      <= ONE_Q;
+            idx             <= 6'd0;
+
+            for (i = 0; i < K_CHUNK_SIZE; i = i + 1) begin
+                exp_array[i] <= {SCORE_WIDTH{1'b0}};
             end
         end else begin
-            saturate_add = temp_result[INTERNAL_ACCUM_WIDTH-1:0];
+            // 单周期脉冲默认清零
+            done          <= 1'b0;
+            max_wr_en     <= 1'b0;
+            sum_wr_en     <= 1'b0;
+            weights_valid <= 1'b0;
+            renorm_en     <= 1'b0;
+
+            case (state)
+                //----------------------------------------------------------
+                // S_IDLE：等待 start
+                //----------------------------------------------------------
+                S_IDLE: begin
+                    busy <= 1'b0;
+                    if (start) begin
+                        busy             <= 1'b1;
+                        idx              <= 6'd0;
+                        chunk_max        <= NEG_INF;
+                        new_sum_internal <= {INTERNAL_ACC_WIDTH{1'b0}};
+
+                        // 读取旧统计量
+                        if (chunk_first) begin
+                            old_max         <= NEG_INF;
+                            old_sum_internal<= {INTERNAL_ACC_WIDTH{1'b0}};
+                        end else begin
+                            old_max <= max_rd_value;
+                            old_sum_internal <= {{(INTERNAL_ACC_WIDTH-ACCUM_WIDTH){sum_rd_value[ACCUM_WIDTH-1]}},
+                                                  sum_rd_value};
+                        end
+                        state <= S_FIND;
+                    end
+                end
+
+                //----------------------------------------------------------
+                // S_FIND：遍历当前 chunk 找 chunk_max
+                //----------------------------------------------------------
+                S_FIND: begin
+                    if (idx < chunk_size) begin
+                        if (scores_array[idx] > chunk_max)
+                            chunk_max <= scores_array[idx];
+                        idx <= idx + 6'd1;
+                    end else begin
+                        state <= S_PREP;
+                    end
+                end
+
+                //----------------------------------------------------------
+                // S_PREP：计算 m_new / alpha_prev / beta_chunk / 初始化 new_sum
+                //----------------------------------------------------------
+                S_PREP: begin
+                    if (chunk_first) begin
+                        new_max         <= chunk_max;
+                        alpha_prev      <= ONE_Q;
+                        beta_chunk      <= ONE_Q;
+                        new_sum_internal<= {INTERNAL_ACC_WIDTH{1'b0}};
+                    end else begin
+                        // m_new = max(old_max, chunk_max)
+                        if (old_max > chunk_max)
+                            m_new_next = old_max;
+                        else
+                            m_new_next = chunk_max;
+
+                        dm_prev   = old_max   - m_new_next;
+                        dm_chunk  = chunk_max - m_new_next;
+                        scale_prev_q  = exp_approx_q14(dm_prev);
+                        scale_chunk_q = exp_approx_q14(dm_chunk);
+
+                        alpha_prev   <= scale_prev_q;
+                        beta_chunk   <= scale_chunk_q;
+                        new_max      <= m_new_next;
+
+                        // l_prev * alpha_prev
+                        old_sum_scaled =
+                            (old_sum_internal *
+                             {{(INTERNAL_ACC_WIDTH-SCORE_WIDTH){scale_prev_q[SCORE_WIDTH-1]}},
+                               scale_prev_q}) >>> FRAC_BITS;
+                        new_sum_internal <= old_sum_scaled;
+                    end
+
+                    idx   <= 6'd0;
+                    state <= S_CLEAR_EXP;
+                end
+
+                //----------------------------------------------------------
+                // S_CLEAR_EXP：清零 exp_array，防止 chunk_size < K_CHUNK_SIZE 时脏数据残留
+                //----------------------------------------------------------
+                S_CLEAR_EXP: begin
+                    if (idx < K_CHUNK_SIZE[5:0]) begin
+                        exp_array[idx] <= {SCORE_WIDTH{1'b0}};
+                        idx <= idx + 6'd1;
+                    end else begin
+                        idx   <= 6'd0;
+                        state <= S_EXP_SUM;
+                    end
+                end
+
+                //----------------------------------------------------------
+                // S_EXP_SUM：计算当前 chunk 的 exp(score - m_new) 并累加到 new_sum_internal
+                //----------------------------------------------------------
+                S_EXP_SUM: begin
+                    if (idx < chunk_size) begin
+                        // 先以 chunk_max 为基准算 exp(score - chunk_max)
+                        delta_local = scores_array[idx] - chunk_max;
+                        exp_local   = exp_approx_q14(delta_local);
+
+                        if (chunk_first) begin
+                            exp_global = exp_local; // m_new == chunk_max
+                        end else begin
+                            // exp(score - m_new) = exp(score - chunk_max) * beta_chunk
+                            mult_tmp   = exp_local * beta_chunk;
+                            exp_global = mult_tmp >>> FRAC_BITS;
+                        end
+
+                        exp_array[idx] <= exp_global;
+                        new_sum_internal <= new_sum_internal +
+                            {{(INTERNAL_ACC_WIDTH-SCORE_WIDTH){exp_global[SCORE_WIDTH-1]}},
+                              exp_global};
+
+                        idx <= idx + 6'd1;
+                    end else begin
+                        state <= S_WRITE;
+                    end
+                end
+
+                //----------------------------------------------------------
+                // S_WRITE：写回 (m_new, l_new)，并给出 renorm_scale
+                //----------------------------------------------------------
+                S_WRITE: begin
+                    // 写 max
+                    max_wr_en    <= 1'b1;
+                    max_wr_head  <= head_idx;
+                    max_wr_row   <= row_idx;
+                    max_wr_value <= new_max;
+
+                    // 写 sum（做简单饱和截位）
+                    sum_wr_en    <= 1'b1;
+                    sum_wr_head  <= head_idx;
+                    sum_wr_row   <= row_idx;
+                    if (new_sum_internal[INTERNAL_ACC_WIDTH-1]) begin
+                        // 负溢出 -> 最小负值
+                        sum_wr_value <= {1'b1, {(ACCUM_WIDTH-1){1'b0}}};
+                    end else if (new_sum_internal >
+                                 {{(INTERNAL_ACC_WIDTH-ACCUM_WIDTH){1'b0}},
+                                   {1'b0, {(ACCUM_WIDTH-1){1'b1}}}}) begin
+                        // 正溢出 -> 最大正值
+                        sum_wr_value <= {1'b0, {(ACCUM_WIDTH-1){1'b1}}};
+                    end else begin
+                        sum_wr_value <= new_sum_internal[ACCUM_WIDTH-1:0];
+                    end
+
+                    // renorm：仅当非首块且 m_new > old_max 时，才需要对旧 O 乘 α_prev
+                    if (!chunk_first && (new_max > old_max)) begin
+                        renorm_en    <= 1'b1;
+                        renorm_scale <= alpha_prev;
+                    end else begin
+                        renorm_en    <= 1'b0;
+                        renorm_scale <= ONE_Q;
+                    end
+
+                    state <= S_DONE;
+                end
+
+                //----------------------------------------------------------
+                // S_DONE：本 chunk 完成，weights_packed 中的分子就绪
+                //----------------------------------------------------------
+                S_DONE: begin
+                    busy          <= 1'b0;
+                    done          <= 1'b1;
+                    weights_valid <= 1'b1;  // exp_array 已经填好
+                    state         <= S_IDLE;
+                end
+
+                default: begin
+                    state <= S_IDLE;
+                end
+            endcase
         end
     end
-endfunction
-
-//================================================================================
-// Generate块：清零exp_values数组（修复第552行问题）
-//================================================================================
-
-genvar gv_exp_clear;
-reg clear_exp_trigger;  // 触发信号
-
-generate
-    for (gv_exp_clear = 0; gv_exp_clear < K_CHUNK_SIZE; gv_exp_clear = gv_exp_clear + 1) begin : gen_exp_clear
-        always @(posedge clk or negedge rst_n) begin
-            if (!rst_n) begin
-                // 复位时清零
-                exp_values[gv_exp_clear] <= {SCORE_WIDTH{1'b0}};
-            end else if (clear_exp_trigger && (gv_exp_clear >= chunk_size)) begin
-                // 运行时条件清零
-                exp_values[gv_exp_clear] <= {SCORE_WIDTH{1'b0}};
-            end else if (state == STATE_COMPUTE_EXP && loop_idx == gv_exp_clear) begin
-                // 正常计算过程中的赋值
-                temp_score = scores_array[loop_idx] - new_max;
-                temp_exp = exp_approx_improved(temp_score);
-                exp_values[gv_exp_clear] <= temp_exp;
-            end
-        end
-    end
-endgenerate
-
-//================================================================================
-// Generate块：复制exp到weights（修复第643行问题）
-//================================================================================
-
-genvar gv_copy;
-reg copy_exp_to_weights;  // 触发信号
-
-generate
-    for (gv_copy = 0; gv_copy < K_CHUNK_SIZE; gv_copy = gv_copy + 1) begin : gen_copy_weights
-        always @(posedge clk or negedge rst_n) begin
-            if (!rst_n) begin
-                weights_array[gv_copy] <= {SCORE_WIDTH{1'b0}};
-            end else if (copy_exp_to_weights) begin
-                weights_array[gv_copy] <= exp_values[gv_copy];
-            end else if (state == STATE_NORMALIZE_LOOP && loop_idx == gv_copy && loop_idx < chunk_size) begin
-                // 归一化过程中的赋值
-                if (new_sum_internal > MIN_SUM_THRESHOLD) begin
-                    if (exp_values[gv_copy][SCORE_WIDTH-1]) begin
-                        mult_product = {{(48-SCORE_WIDTH){1'b1}}, exp_values[gv_copy]};
-                    end else begin
-                        mult_product = {{(48-SCORE_WIDTH){1'b0}}, exp_values[gv_copy]};
-                    end
-                    mult_product = mult_product <<< FRAC_BITS;
-                    mult_temp = mult_product[INTERNAL_ACCUM_WIDTH+FRAC_BITS-1:0] / new_sum_internal;
-                    
-                    if (mult_temp > 32'sd32767) begin
-                        weights_array[gv_copy] <= 16'sd32767;
-                    end else if (mult_temp < -32'sd32768) begin
-                        weights_array[gv_copy] <= -16'sd32768;
-                    end else begin
-                        weights_array[gv_copy] <= mult_temp[15:0];
-                    end
-                end else begin
-                    mult_temp = 32'sd16384 / chunk_size;
-                    weights_array[gv_copy] <= mult_temp[15:0];
-                end
-            end else if (state == STATE_NORMALIZE_LOOP && gv_copy >= chunk_size && loop_idx >= chunk_size) begin
-                // 清零超出chunk_size的元素
-                weights_array[gv_copy] <= {SCORE_WIDTH{1'b0}};
-            end
-        end
-    end
-endgenerate
-
-//================================================================================
-// 主状态机（简化版，移除了for循环）
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        state <= STATE_IDLE;
-        done <= 1'b0;
-        busy <= 1'b0;
-        max_wr_en <= 1'b0;
-        sum_wr_en <= 1'b0;
-        renorm_en <= 1'b0;
-        weights_valid <= 1'b0;
-        loop_idx <= 6'd0;
-        clear_exp_trigger <= 1'b0;
-        copy_exp_to_weights <= 1'b0;
-    end else begin
-        // 默认值
-        max_wr_en <= 1'b0;
-        sum_wr_en <= 1'b0;
-        renorm_en <= 1'b0;
-        weights_valid <= 1'b0;
-        done <= 1'b0;
-        clear_exp_trigger <= 1'b0;
-        copy_exp_to_weights <= 1'b0;
-        
-        case (state)
-            //================================================================
-            // STATE_IDLE：等待启动
-            //================================================================
-            STATE_IDLE: begin
-                if (start) begin
-                    busy <= 1'b1;
-                    state <= STATE_LOAD_STATS;
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t] Softmax Start: head=%0d, row=%0d, chunk=%0d, size=%0d, first=%0b, last=%0b",
-                             $time, head_idx, row_idx, chunk_id, chunk_size, chunk_first, chunk_last);
-                    `endif
-                end
-            end
-            
-            //================================================================
-            // STATE_LOAD_STATS：加载统计量
-            //================================================================
-            STATE_LOAD_STATS: begin
-                if (chunk_first) begin
-                    old_max <= NEG_INF;
-                    old_sum_internal <= {INTERNAL_ACCUM_WIDTH{1'b0}};
-                end else begin
-                    old_max <= max_rd_value;
-                    
-                    // 扩展sum到内部位宽
-                    if (sum_rd_value[ACCUM_WIDTH-1]) begin
-                        old_sum_internal <= {{(INTERNAL_ACCUM_WIDTH-ACCUM_WIDTH){1'b1}}, sum_rd_value};
-                    end else begin
-                        old_sum_internal <= {{(INTERNAL_ACCUM_WIDTH-ACCUM_WIDTH){1'b0}}, sum_rd_value};
-                    end
-                end
-                
-                state <= STATE_FIND_MAX_INIT;
-                
-                `ifdef DEBUG_SOFTMAX
-                $display("[%0t]   Loaded stats: old_max=%0d, old_sum=%0d",
-                         $time, chunk_first ? NEG_INF : max_rd_value,
-                         chunk_first ? 0 : sum_rd_value);
-                `endif
-            end
-            
-            //================================================================
-            // STATE_FIND_MAX_INIT：初始化查找最大值
-            //================================================================
-            STATE_FIND_MAX_INIT: begin
-                loop_idx <= 6'd0;
-                chunk_max <= NEG_INF;
-                state <= STATE_FIND_MAX_LOOP;
-            end
-            
-            //================================================================
-            // STATE_FIND_MAX_LOOP：顺序查找chunk的最大值
-            //================================================================
-            STATE_FIND_MAX_LOOP: begin
-                if (loop_idx < chunk_size) begin
-                    if (scores_array[loop_idx] > chunk_max) begin
-                        chunk_max <= scores_array[loop_idx];
-                    end
-                    loop_idx <= loop_idx + 1'b1;
-                end else begin
-                    state <= STATE_UPDATE_MAX;
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t]   Chunk max found: %0d", $time, chunk_max);
-                    `endif
-                end
-            end
-            
-            //================================================================
-            // STATE_UPDATE_MAX：更新全局最大值
-            //================================================================
-            STATE_UPDATE_MAX: begin
-                if (chunk_max > old_max) begin
-                    new_max <= chunk_max;
-                    max_updated <= 1'b1;
-                    
-                    // 计算重归一化scale: exp(old_max - new_max)
-                    if (!chunk_first) begin
-                        renorm_scale <= exp_approx_improved(old_max - chunk_max);
-                    end
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t]   Max updated: %0d -> %0d", $time, old_max, chunk_max);
-                    `endif
-                end else begin
-                    new_max <= old_max;
-                    max_updated <= 1'b0;
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t]   Max unchanged: %0d", $time, old_max);
-                    `endif
-                end
-                
-                // 如果max更新且存在旧sum，需重归一化旧sum
-                if (chunk_max > old_max && !chunk_first) begin
-                    temp_sum = old_sum_internal * {{(INTERNAL_ACCUM_WIDTH-SCORE_WIDTH){1'b0}}, 
-                                                    exp_approx_improved(old_max - chunk_max)};
-                    old_sum_internal <= temp_sum >>> FRAC_BITS;
-                end
-                
-                loop_idx <= 6'd0;
-                state <= STATE_COMPUTE_EXP;
-            end
-            
-            //================================================================
-            // STATE_COMPUTE_EXP：顺序计算exp（使用generate块）
-            //================================================================
-            STATE_COMPUTE_EXP: begin
-                if (loop_idx < chunk_size) begin
-                    // exp计算在generate块中完成
-                    loop_idx <= loop_idx + 1'b1;
-                end else begin
-                    // 触发清零超出chunk_size的元素
-                    clear_exp_trigger <= 1'b1;
-                    
-                    // 重置循环索引，准备累加
-                    loop_idx <= 6'd0;
-                    new_sum_internal <= old_sum_internal;
-                    state <= STATE_ACCUMULATE_SUM;
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t]   Exp computation done", $time);
-                    `endif
-                end
-            end
-            
-            //================================================================
-            // STATE_ACCUMULATE_SUM：顺序累加sum
-            //================================================================
-            STATE_ACCUMULATE_SUM: begin
-                if (loop_idx < chunk_size) begin
-                    // 扩展exp_values到内部累加器位宽
-                    if (exp_values[loop_idx][SCORE_WIDTH-1]) begin
-                        temp_sum = {{(INTERNAL_ACCUM_WIDTH-SCORE_WIDTH){1'b1}}, exp_values[loop_idx]};
-                    end else begin
-                        temp_sum = {{(INTERNAL_ACCUM_WIDTH-SCORE_WIDTH){1'b0}}, exp_values[loop_idx]};
-                    end
-                    
-                    new_sum_internal <= saturate_add(new_sum_internal, temp_sum);
-                    loop_idx <= loop_idx + 1'b1;
-                end else begin
-                    state <= STATE_WRITE_STATS;
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t]   Sum accumulated: %0d", $time, new_sum_internal);
-                    `endif
-                end
-            end
-            
-            //================================================================
-            // STATE_WRITE_STATS：写回统计量
-            //================================================================
-            STATE_WRITE_STATS: begin
-                max_wr_en <= 1'b1;
-                max_wr_head <= head_idx;
-                max_wr_row <= row_idx;
-                max_wr_value <= new_max;
-                
-                sum_wr_en <= 1'b1;
-                sum_wr_head <= head_idx;
-                sum_wr_row <= row_idx;
-                
-                // 饱和截断到ACCUM_WIDTH
-                if (new_sum_internal > {{(INTERNAL_ACCUM_WIDTH-ACCUM_WIDTH){1'b0}}, 
-                                        {1'b0, {(ACCUM_WIDTH-1){1'b1}}}}) begin
-                    sum_wr_value <= {1'b0, {(ACCUM_WIDTH-1){1'b1}}};
-                end else if (new_sum_internal < {{(INTERNAL_ACCUM_WIDTH-ACCUM_WIDTH){1'b1}}, 
-                                                  {1'b1, {(ACCUM_WIDTH-1){1'b0}}}}) begin
-                    sum_wr_value <= {1'b1, {(ACCUM_WIDTH-1){1'b0}}};
-                end else begin
-                    sum_wr_value <= new_sum_internal[ACCUM_WIDTH-1:0];
-                end
-                
-                if (max_updated && !chunk_first) begin
-                    renorm_en <= 1'b1;
-                end
-                
-                `ifdef DEBUG_SOFTMAX
-                $display("[%0t]   Write stats: max=%0d, sum=%0d, renorm=%0b",
-                         $time, new_max, new_sum_internal[ACCUM_WIDTH-1:0], max_updated);
-                `endif
-                
-                if (chunk_last) begin
-                    loop_idx <= 6'd0;
-                    state <= STATE_NORMALIZE_INIT;
-                end else begin
-                    // 触发复制exp_values到weights_array
-                    copy_exp_to_weights <= 1'b1;
-                    state <= STATE_DONE;
-                end
-            end
-            
-            //================================================================
-            // STATE_NORMALIZE_INIT：初始化归一化
-            //================================================================
-            STATE_NORMALIZE_INIT: begin
-                loop_idx <= 6'd0;
-                state <= STATE_NORMALIZE_LOOP;
-                
-                `ifdef DEBUG_SOFTMAX
-                $display("[%0t]   Start normalization: sum=%0d", $time, new_sum_internal);
-                `endif
-            end
-            
-            //================================================================
-            // STATE_NORMALIZE_LOOP：顺序归一化（在generate块中完成）
-            //================================================================
-            STATE_NORMALIZE_LOOP: begin
-                if (loop_idx < chunk_size) begin
-                    // 归一化计算在generate块中完成
-                    loop_idx <= loop_idx + 1'b1;
-                end else begin
-                    state <= STATE_DONE;
-                    
-                    `ifdef DEBUG_SOFTMAX
-                    $display("[%0t]   Normalization done", $time);
-                    `endif
-                end
-            end
-            
-            //================================================================
-            // STATE_DONE：完成
-            //================================================================
-            STATE_DONE: begin
-                weights_valid <= 1'b1;
-                done <= 1'b1;
-                busy <= 1'b0;
-                
-                `ifdef DEBUG_SOFTMAX
-                $display("[%0t] Softmax Done", $time);
-                `endif
-                
-                state <= STATE_IDLE;
-            end
-            
-            default: begin
-                state <= STATE_IDLE;
-            end
-        endcase
-    end
-end
-
-//================================================================================
-// 调试支持
-//================================================================================
-
-`ifdef DEBUG_SOFTMAX
-always @(posedge clk) begin
-    if (state != STATE_IDLE && state != STATE_DONE) begin
-        $display("[%0t] State=%0d, loop_idx=%0d", $time, state, loop_idx);
-    end
-end
-`endif
 
 endmodule
