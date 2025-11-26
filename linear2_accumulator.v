@@ -21,7 +21,6 @@
 // - 处理溢出和精度损失
 //
 //================================================================================
-
 module linear2_accumulator #(
     parameter TOKEN_CHUNK    = 32,
     parameter OUTPUT_DIM     = 32,
@@ -131,7 +130,7 @@ always @(*) begin
                 partial_aligned[i] = {{(OUTPUT_MANT_W-INPUT_MANT_W){partial_mant_unpacked[i][INPUT_MANT_W-1]}},
                                      partial_mant_unpacked[i]};
             end else begin
-                // 截断（理论上不应该发生）
+                // 截断或保持不变
                 partial_aligned[i] = partial_mant_unpacked[i][INPUT_MANT_W-1 -: OUTPUT_MANT_W];
             end
         end
@@ -157,11 +156,20 @@ always @(*) begin
             if (shift_amount >= INPUT_MANT_W) begin
                 // 右移太多，直接置0
                 partial_aligned[i] = {OUTPUT_MANT_W{1'b0}};
-            end else begin:test
+            end else begin:l
+                // [FIXED HERE] 修复 Zero Replication Warning
                 // 先扩展，再右移
                 reg signed [OUTPUT_MANT_W-1:0] partial_extended;
-                partial_extended = {{(OUTPUT_MANT_W-INPUT_MANT_W){partial_mant_unpacked[i][INPUT_MANT_W-1]}},
-                                   partial_mant_unpacked[i]};
+                
+                if (OUTPUT_MANT_W > INPUT_MANT_W) begin
+                    // 只有当输出位宽大于输入位宽时，才进行显式符号扩展
+                    partial_extended = {{(OUTPUT_MANT_W-INPUT_MANT_W){partial_mant_unpacked[i][INPUT_MANT_W-1]}},
+                                       partial_mant_unpacked[i]};
+                end else begin
+                    // 位宽相同或输出更小，直接赋值（Verilog会自动处理signed赋值）
+                    partial_extended = partial_mant_unpacked[i];
+                end
+                
                 partial_aligned[i] = partial_extended >>> shift_amount;
             end
         end
@@ -264,32 +272,5 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
-//================================================================================
-// 调试信号
-//================================================================================
-
-`ifdef SIMULATION
-always @(posedge clk) begin
-    if (clear) begin
-        $display("[%0t] Accum: Cleared for new token batch", $time);
-    end
-    
-    if (enable) begin
-        $display("[%0t] Accum: Chunk %0d/%0d - exp_partial=%0d, exp_accum=%0d, exp_diff=%0d, new_exp=%0d", 
-                 $time, accum_count, NUM_CHUNKS, partial_exp, accum_exp, exp_diff, new_shared_exp);
-        
-        if (accum_count == 3'd0) begin
-            $display("[%0t] Accum: First chunk - direct assignment", $time);
-        end else begin
-            $display("[%0t] Accum: Aligning and accumulating (shift_amount=%0d)", $time, shift_amount);
-        end
-    end
-    
-    if (result_valid) begin
-        $display("[%0t] Accum: Result ready - exp=%0d, accumulated %0d chunks", 
-                 $time, result_exp, NUM_CHUNKS);
-    end
-end
-`endif
 
 endmodule

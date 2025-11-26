@@ -3,15 +3,6 @@
 //================================================================================
 // MEIGA Top Module - 系统顶层集成 (Updated Version)
 //
-// 更新日期: 2025-11-16
-// 版本: v2.0
-//
-// 主要更新:
-// 1. ✅ 新增 FFN权重接口（Backbone和SideNet）
-// 2. ❌ 删除 LN1暂存接口（现在使用内部buffer）
-// 3. ⚠️  更新 LayerNorm接口为ln_param_valid
-// 4. ✅ 所有权重改为数组格式（每列独立指数）
-//
 // 功能：
 // 集成Backbone Transformer和SideNet，实现完整的MEIGA架构
 // - 4层Backbone Transformer（分时复用单个模块）
@@ -862,10 +853,11 @@ sidenet_layer4 #(
 //------------------------------------------------------------------------
 sidenet_layer_output_buffer #(
     .TOKEN_NUM(TOKEN_NUM),
-    .DIM(SIDENET_DIM),
+    .DIM_L0_L3(8),
+    .DIM_L4(32),
     .DATA_WIDTH(DATA_WIDTH_SN),
     .EXP_WIDTH(EXP_WIDTH),
-    .NUM_LAYERS(4),
+    .NUM_LAYERS(5),
     .ADDR_WIDTH(ADDR_WIDTH),
     .LAYER_WIDTH(2)
 ) u_sidenet_layer_output_buffer (

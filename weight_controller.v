@@ -48,6 +48,8 @@
 // 作者：Claude
 //================================================================================
 
+`timescale 1ns / 1ps
+
 module weight_controller #(
     parameter NUM_LAYERS      = 4,
     parameter DIM             = 32,
@@ -55,7 +57,7 @@ module weight_controller #(
     parameter EXP_WIDTH       = 8,
     parameter DRAM_ADDR_WIDTH = 32,
     parameter DRAM_DATA_WIDTH = 256,
-    parameter CACHE_ENTRIES   = 4          // 缓存4个权重块
+    parameter CACHE_ENTRIES   = 4
 )(
     input  wire clk,
     input  wire rst_n,
@@ -63,16 +65,16 @@ module weight_controller #(
     //================================================================================
     // 配置接口
     //================================================================================
-    input  wire [1:0] current_layer_id,                    // 当前处理的层
-    input  wire [DRAM_ADDR_WIDTH-1:0] weight_base_addr,    // 权重DRAM基地址
+    input  wire [1:0] current_layer_id,
+    input  wire [DRAM_ADDR_WIDTH-1:0] weight_base_addr,
     
     //================================================================================
     // QKV权重接口（数组格式）
     //================================================================================
-    input  wire qkv_weight_req,
-    input  wire [1:0] qkv_weight_type,                     // 00=Q, 01=K, 10=V
-    output reg  qkv_weight_ack,                            // ACK握手
-    output reg  qkv_weight_valid,                          // DATA有效
+    input  wire qkv_weight_req,                                // 请求加载Q/K/V权重
+    input  wire [1:0] qkv_weight_type,                         // 00=Q, 01=K, 10=V
+    output reg  qkv_weight_ack,                                // ACK握手
+    output reg  qkv_weight_valid,                              // DATA有效
     output reg  [32*EXP_WIDTH-1:0] qkv_weight_exp_array,
     output reg  [32*32*DATA_WIDTH-1:0] qkv_weight_mant_blocks,
     
@@ -88,8 +90,8 @@ module weight_controller #(
     // FFN权重接口（数组格式）
     //================================================================================
     input  wire ffn_weight_req,
-    input  wire [1:0] ffn_weight_type,                     // 00=W1, 01=W2
-    input  wire [1:0] ffn_weight_chunk_id,                 // 0-3
+    input  wire [1:0] ffn_weight_type,                         // 00=W1, 01=W2
+    input  wire [1:0] ffn_weight_chunk_id,                     // 0-3
     output reg  ffn_weight_ready,
     output reg  [32*EXP_WIDTH-1:0] ffn_weight_exp_array,
     output reg  [32*32*DATA_WIDTH-1:0] ffn_weight_mant,
@@ -98,35 +100,35 @@ module weight_controller #(
     // LayerNorm参数接口（单指数格式）
     //================================================================================
     input  wire ln_param_req,
-    input  wire [1:0] ln_param_type,                       // 00=LN1_g, 01=LN1_b, 10=LN2_g, 11=LN2_b
-    output reg  ln_param_valid,                            // 修复：改为valid以匹配backbone_transformer
+    input  wire [1:0] ln_param_type,                           // 00=LN1_GAMMA, 01=LN1_BETA, 10=LN2_GAMMA, 11=LN2_BETA
+    output reg  ln_param_valid,
     output reg  [EXP_WIDTH-1:0] ln_param_exp,
     output reg  [DIM*DATA_WIDTH-1:0] ln_param_mant,
     
     //================================================================================
-    // DMA接口
+    // DMA读接口
     //================================================================================
     output reg  dma_req_valid,
     output reg  [DRAM_ADDR_WIDTH-1:0] dma_req_addr,
-    output reg  [7:0] dma_req_burst_len,                   // 突发长度
+    output reg  [7:0] dma_req_burst_len,
     input  wire dma_req_ready,
     
     input  wire dma_rsp_valid,
     input  wire [DRAM_DATA_WIDTH-1:0] dma_rsp_data,
     input  wire dma_rsp_last,
-    output wire dma_rsp_ready,
+    output reg  dma_rsp_ready,
     
     //================================================================================
-    // 调试接口
+    // Debug信号
     //================================================================================
-    output wire [3:0] dbg_state,
+    output reg  [3:0] dbg_state,
     output reg  [31:0] dbg_cache_hit_count,
     output reg  [31:0] dbg_cache_miss_count,
     output reg  [31:0] dbg_dma_req_count
 );
 
 //================================================================================
-// 本地参数
+// 常量定义
 //================================================================================
 
 // 权重类型编码
@@ -165,8 +167,6 @@ localparam RESPOND       = 4'd8;
 
 reg [3:0] state, next_state;
 
-assign dbg_state = state;
-
 //================================================================================
 // 内部信号
 //================================================================================
@@ -181,29 +181,44 @@ reg [1:0] serving_layer;
 // 权重矩阵缓存（数组格式，用于WQ/WK/WV/WO/W1/W2）
 //================================================================================
 
-reg [3:0] weight_cache_valid;
-reg [3:0] weight_cache_type [0:3];
-reg [1:0] weight_cache_chunk_id [0:3];
-reg [1:0] weight_cache_layer [0:3];
-reg [1:0] weight_cache_lru [0:3];
+reg [3:0] weight_cache_type     [0:CACHE_ENTRIES-1]; // TYPE_WQ, TYPE_WK, ...
+reg [1:0] weight_cache_chunk_id [0:CACHE_ENTRIES-1]; // 0~3
+reg [1:0] weight_cache_layer    [0:CACHE_ENTRIES-1]; // layer id
+reg       weight_cache_valid    [0:CACHE_ENTRIES-1];
 
-reg [32*EXP_WIDTH-1:0] weight_cache_exp_array [0:3];
-reg [32*32*DATA_WIDTH-1:0] weight_cache_mant_blocks [0:3];
+reg [32*EXP_WIDTH-1:0]      weight_cache_exp_array     [0:CACHE_ENTRIES-1];
+reg [32*32*DATA_WIDTH-1:0]  weight_cache_mant_blocks   [0:CACHE_ENTRIES-1];
 
-//================================================================================
+// 缓存LRU信息
+reg [31:0] weight_cache_age [0:CACHE_ENTRIES-1];  // 简单LRU: age越大，越久未使用
+
 // LayerNorm参数缓存（单指数格式）
-//================================================================================
+reg [3:0] ln_cache_type     [0:CACHE_ENTRIES-1]; // TYPE_LN1_GAMMA, TYPE_LN1_BETA, ...
+reg [1:0] ln_cache_layer    [0:CACHE_ENTRIES-1];
+reg       ln_cache_valid    [0:CACHE_ENTRIES-1];
 
-reg [3:0] ln_cache_valid;
-reg [3:0] ln_cache_type [0:3];
-reg [1:0] ln_cache_layer [0:3];
-reg [1:0] ln_cache_lru [0:3];
-
-reg [EXP_WIDTH-1:0] ln_cache_exp [0:3];
-reg [DIM*DATA_WIDTH-1:0] ln_cache_mant [0:3];
+reg [EXP_WIDTH-1:0]        ln_cache_exp [0:CACHE_ENTRIES-1];
+reg [DIM*DATA_WIDTH-1:0]   ln_cache_mant[0:CACHE_ENTRIES-1];
 
 //================================================================================
-// 缓存命中信号
+// DMA接收缓冲
+//================================================================================
+
+reg [32*EXP_WIDTH-1:0]     dma_rcv_exp_array;
+reg [32*32*DATA_WIDTH-1:0] dma_rcv_mant_blocks;
+reg [EXP_WIDTH-1:0]        dma_rcv_ln_exp;
+reg [DIM*DATA_WIDTH-1:0]   dma_rcv_ln_mant;
+
+//================================================================================
+// 地址计算相关
+//================================================================================
+
+reg [DRAM_ADDR_WIDTH-1:0] serving_base_addr;
+reg [DRAM_ADDR_WIDTH-1:0] dma_target_addr;
+reg [7:0]                 dma_burst_len;
+
+//================================================================================
+// 缓存命中信息
 //================================================================================
 
 reg weight_cache_hit;
@@ -212,60 +227,31 @@ reg ln_cache_hit;
 reg [1:0] ln_cache_hit_index;
 
 //================================================================================
-// DMA接收缓冲
+// 通用索引变量
 //================================================================================
 
-// 权重矩阵接收缓冲（数组格式）
-reg [32*EXP_WIDTH-1:0] dma_rcv_exp_array;
-reg [32*32*DATA_WIDTH-1:0] dma_rcv_mant_blocks;
-
-// LayerNorm参数接收缓冲（单指数格式）
-reg [EXP_WIDTH-1:0] dma_rcv_ln_exp;
-reg [DIM*DATA_WIDTH-1:0] dma_rcv_ln_mant;
-
-reg [5:0] dma_rcv_count;
+integer i, j;
 
 //================================================================================
-// 地址计算
-//================================================================================
-
-reg [DRAM_ADDR_WIDTH-1:0] weight_addr;
-reg [7:0] burst_len;
-
-//================================================================================
-// 循环变量声明（Verilog 2001）
-//================================================================================
-
-integer i;
-
-//================================================================================
-// 初始化
-//================================================================================
-
-initial begin
-    for (i = 0; i < 4; i = i + 1) begin
-        weight_cache_valid[i] = 1'b0;
-        weight_cache_lru[i] = 2'b00;
-        ln_cache_valid[i] = 1'b0;
-        ln_cache_lru[i] = 2'b00;
-    end
-end
-
-//================================================================================
-// 状态转移
+// 状态机时序部分
 //================================================================================
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         state <= IDLE;
+        dbg_state <= IDLE;
     end else begin
         state <= next_state;
+        dbg_state <= next_state;
     end
 end
 
+//================================================================================
+// 状态机组合部分
+//================================================================================
+
 always @(*) begin
     next_state = state;
-    
     case (state)
         IDLE: begin
             if (qkv_weight_req || wo_weight_req || ffn_weight_req || ln_param_req) begin
@@ -278,10 +264,23 @@ always @(*) begin
         end
         
         CHECK_CACHE: begin
-            if (weight_cache_hit || ln_cache_hit) begin
-                next_state = RESPOND;
+            if (serving_type == TYPE_LN1_GAMMA ||
+                serving_type == TYPE_LN1_BETA  ||
+                serving_type == TYPE_LN2_GAMMA ||
+                serving_type == TYPE_LN2_BETA) begin
+                // LayerNorm参数
+                if (ln_cache_hit) begin
+                    next_state = RESPOND;
+                end else begin
+                    next_state = CALC_ADDR;
+                end
             end else begin
-                next_state = CALC_ADDR;
+                // 权重矩阵（WQ/WK/WV/WO/W1/W2）
+                if (weight_cache_hit) begin
+                    next_state = RESPOND;
+                end else begin
+                    next_state = CALC_ADDR;
+                end
             end
         end
         
@@ -302,7 +301,7 @@ always @(*) begin
         end
         
         DMA_RECEIVE: begin
-            if (dma_rsp_last) begin
+            if (dma_rsp_valid && dma_rsp_last) begin
                 next_state = CACHE_UPDATE;
             end
         end
@@ -320,43 +319,63 @@ always @(*) begin
 end
 
 //================================================================================
-// 仲裁逻辑
+// 请求仲裁逻辑
 //================================================================================
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         serving_requester <= REQ_NONE;
-        serving_type <= 4'h0;
-        serving_chunk_id <= 2'd0;
-        serving_layer <= 2'd0;
-    end else if (state == ARBITRATE) begin
-        serving_layer <= current_layer_id;
-        
-        // 优先级：QKV > WO > FFN > LN
+        serving_type      <= 4'h0;
+        serving_chunk_id  <= 2'b00;
+        serving_layer     <= 2'b00;
+    end else if (state == IDLE && next_state == ARBITRATE) begin
+        // 简单优先级仲裁：QKV > WO > FFN > LN
         if (qkv_weight_req) begin
             serving_requester <= REQ_QKV;
-            serving_type <= {2'b00, qkv_weight_type};  // 0/1/2
-            serving_chunk_id <= 2'd0;
+            serving_layer     <= current_layer_id;
+            case (qkv_weight_type)
+                2'b00: serving_type <= TYPE_WQ;
+                2'b01: serving_type <= TYPE_WK;
+                2'b10: serving_type <= TYPE_WV;
+                default: serving_type <= TYPE_WQ;
+            endcase
+            serving_chunk_id <= 2'b00;    // QKV一次性请求全chunk
         end else if (wo_weight_req) begin
             serving_requester <= REQ_WO;
-            serving_type <= TYPE_WO;  // 3
-            serving_chunk_id <= 2'd0;
+            serving_layer     <= current_layer_id;
+            serving_type      <= TYPE_WO;
+            serving_chunk_id  <= 2'b00;   // WO一次性请求全chunk
         end else if (ffn_weight_req) begin
             serving_requester <= REQ_FFN;
-            serving_type <= {2'b01, ffn_weight_type[0]};  // 4或5
+            serving_layer     <= current_layer_id;
+            case (ffn_weight_type)
+                2'b00: serving_type <= TYPE_W1;
+                2'b01: serving_type <= TYPE_W2;
+                default: serving_type <= TYPE_W1;
+            endcase
             serving_chunk_id <= ffn_weight_chunk_id;
         end else if (ln_param_req) begin
             serving_requester <= REQ_LN;
-            serving_type <= {2'b10, ln_param_type};  // 8-11
-            serving_chunk_id <= 2'd0;
+            serving_layer     <= current_layer_id;
+            case (ln_param_type)
+                2'b00: serving_type <= TYPE_LN1_GAMMA;
+                2'b01: serving_type <= TYPE_LN1_BETA;
+                2'b10: serving_type <= TYPE_LN2_GAMMA;
+                2'b11: serving_type <= TYPE_LN2_BETA;
+                default: serving_type <= TYPE_LN1_GAMMA;
+            endcase
+            serving_chunk_id <= 2'b00;
         end else begin
             serving_requester <= REQ_NONE;
+            serving_type      <= 4'h0;
+            serving_chunk_id  <= 2'b00;
+            serving_layer     <= 2'b00;
         end
     end
 end
 
 //================================================================================
-// 缓存查找逻辑
+// 缓存命中检测
 //================================================================================
 
 always @(*) begin
@@ -377,7 +396,7 @@ always @(*) begin
                 weight_cache_hit_index = i[1:0];
             end
         end
-    end else if (serving_type >= 4'h8 && serving_type <= 4'hB) begin
+    end else begin
         // LayerNorm参数
         for (i = 0; i < 4; i = i + 1) begin
             if (ln_cache_valid[i] &&
@@ -394,62 +413,36 @@ end
 // 地址计算逻辑
 //================================================================================
 
-always @(*) begin:w1
-    reg [31:0] layer_base;
-    reg [31:0] offset;
-    
-    layer_base = weight_base_addr + ({30'h0, serving_layer} << 14);  // ×16KB
-    
-    case (serving_type)
-        TYPE_WQ: begin
-            offset = 32'h0000;
-            burst_len = 8'd33;  // 1056B / 32B
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        serving_base_addr <= {DRAM_ADDR_WIDTH{1'b0}};
+        dma_target_addr   <= {DRAM_ADDR_WIDTH{1'b0}};
+        dma_burst_len     <= 8'd0;
+    end else if (state == CALC_ADDR) begin
+        serving_base_addr <= weight_base_addr;
+        
+        if (serving_type == TYPE_WQ || serving_type == TYPE_WK || serving_type == TYPE_WV) begin
+            dma_target_addr <= weight_base_addr
+                               + serving_layer * 32'h0001_0000
+                               + {serving_type[1:0], 14'h0};
+            dma_burst_len   <= 8'd32;
+        end else if (serving_type == TYPE_WO) begin
+            dma_target_addr <= weight_base_addr
+                               + serving_layer * 32'h0001_0000
+                               + 32'h0000_4000;
+            dma_burst_len   <= 8'd32;
+        end else if (serving_type == TYPE_W1 || serving_type == TYPE_W2) begin
+            dma_target_addr <= weight_base_addr
+                               + serving_layer * 32'h0002_0000
+                               + {serving_type[1:0], serving_chunk_id, 12'h000};
+            dma_burst_len   <= 8'd32;
+        end else begin
+            dma_target_addr <= weight_base_addr
+                               + serving_layer * 32'h0000_1000
+                               + {serving_type[1:0], 10'h0};
+            dma_burst_len   <= 8'd4;
         end
-        TYPE_WK: begin
-            offset = 32'h0420;
-            burst_len = 8'd33;
-        end
-        TYPE_WV: begin
-            offset = 32'h0840;
-            burst_len = 8'd33;
-        end
-        TYPE_WO: begin
-            offset = 32'h0C60;
-            burst_len = 8'd33;
-        end
-        TYPE_W1: begin
-            offset = 32'h1080 + ({28'h0, serving_chunk_id, 2'b00} << 8) + 
-                     ({28'h0, serving_chunk_id, 2'b00} << 5);  // chunk × 0x420
-            burst_len = 8'd33;
-        end
-        TYPE_W2: begin
-            offset = 32'h2100 + ({28'h0, serving_chunk_id, 2'b00} << 8) + 
-                     ({28'h0, serving_chunk_id, 2'b00} << 5);
-            burst_len = 8'd33;
-        end
-        TYPE_LN1_GAMMA: begin
-            offset = 32'h3180;
-            burst_len = 8'd2;  // 33B / 32B
-        end
-        TYPE_LN1_BETA: begin
-            offset = 32'h31A1;
-            burst_len = 8'd2;
-        end
-        TYPE_LN2_GAMMA: begin
-            offset = 32'h31C2;
-            burst_len = 8'd2;
-        end
-        TYPE_LN2_BETA: begin
-            offset = 32'h31E3;
-            burst_len = 8'd2;
-        end
-        default: begin
-            offset = 32'h0;
-            burst_len = 8'd1;
-        end
-    endcase
-    
-    weight_addr = layer_base + offset;
+    end
 end
 
 //================================================================================
@@ -459,17 +452,24 @@ end
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         dma_req_valid <= 1'b0;
-        dma_req_addr <= {DRAM_ADDR_WIDTH{1'b0}};
-        dma_req_burst_len <= 8'h0;
+        dma_req_addr  <= {DRAM_ADDR_WIDTH{1'b0}};
+        dma_req_burst_len <= 8'd0;
+        dma_rsp_ready <= 1'b0;
         dbg_dma_req_count <= 32'h0;
     end else begin
+        dma_req_valid <= 1'b0;
+        
         if (state == DMA_REQUEST && !dma_req_valid) begin
-            dma_req_valid <= 1'b1;
-            dma_req_addr <= weight_addr;
-            dma_req_burst_len <= burst_len;
+            dma_req_valid     <= 1'b1;
+            dma_req_addr      <= dma_target_addr;
+            dma_req_burst_len <= dma_burst_len;
             dbg_dma_req_count <= dbg_dma_req_count + 1;
-        end else if (dma_req_valid && dma_req_ready) begin
-            dma_req_valid <= 1'b0;
+        end
+        
+        if (state == DMA_WAIT || state == DMA_RECEIVE) begin
+            dma_rsp_ready <= 1'b1;
+        end else begin
+            dma_rsp_ready <= 1'b0;
         end
     end
 end
@@ -478,163 +478,151 @@ end
 // DMA接收逻辑
 //================================================================================
 
-assign dma_rsp_ready = (state == DMA_RECEIVE);
-
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        dma_rcv_count <= 6'h0;
-        dma_rcv_exp_array <= {32*EXP_WIDTH{1'b0}};
+        dma_rcv_exp_array   <= {32*EXP_WIDTH{1'b0}};
         dma_rcv_mant_blocks <= {32*32*DATA_WIDTH{1'b0}};
-        dma_rcv_ln_exp <= {EXP_WIDTH{1'b0}};
-        dma_rcv_ln_mant <= {DIM*DATA_WIDTH{1'b0}};
-    end else if (state == DMA_RECEIVE && dma_rsp_valid) begin
-        
+        dma_rcv_ln_exp      <= {EXP_WIDTH{1'b0}};
+        dma_rcv_ln_mant     <= {DIM*DATA_WIDTH{1'b0}};
+    end else if (state == DMA_RECEIVE && dma_rsp_valid && dma_rsp_ready) begin
         if (serving_type <= 4'h5) begin
-            // 权重矩阵（数组格式）
-            if (dma_rcv_count == 0) begin
-                // 第一个burst包含32个指数
-                dma_rcv_exp_array <= dma_rsp_data[32*EXP_WIDTH-1:0];
-            end else begin
-                // 后续burst包含尾数数据
-                dma_rcv_mant_blocks[(dma_rcv_count-1)*DRAM_DATA_WIDTH +: DRAM_DATA_WIDTH] 
-                    <= dma_rsp_data;
-            end
         end else begin
-            // LayerNorm参数（单指数格式）
-            if (dma_rcv_count == 0) begin
-                // 第一个burst包含1个指数 + 部分尾数
-                dma_rcv_ln_exp <= dma_rsp_data[EXP_WIDTH-1:0];
-                dma_rcv_ln_mant[0 +: (DRAM_DATA_WIDTH-EXP_WIDTH)] 
-                    <= dma_rsp_data[DRAM_DATA_WIDTH-1:EXP_WIDTH];
-            end else if (dma_rcv_count == 1) begin
-                // 第二个burst包含剩余尾数
-                dma_rcv_ln_mant[(DRAM_DATA_WIDTH-EXP_WIDTH) +: 
-                    (DIM*DATA_WIDTH-(DRAM_DATA_WIDTH-EXP_WIDTH))]
-                    <= dma_rsp_data[0 +: (DIM*DATA_WIDTH-(DRAM_DATA_WIDTH-EXP_WIDTH))];
-            end
-        end
-        
-        dma_rcv_count <= dma_rcv_count + 1;
-        
-        if (dma_rsp_last) begin
-            dma_rcv_count <= 6'h0;
         end
     end
 end
 
 //================================================================================
-// 缓存更新逻辑（LRU）
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin:lru
-    reg [1:0] lru_idx;
-    reg [1:0] max_lru;
-    
-    if (!rst_n) begin
-        weight_cache_valid <= 4'b0000;
-        ln_cache_valid <= 4'b0000;
-        dbg_cache_miss_count <= 32'h0;
-    end else if (state == CACHE_UPDATE) begin
-        dbg_cache_miss_count <= dbg_cache_miss_count + 1;
-        
-        if (serving_type >= 4'h8 && serving_type <= 4'hB) begin
-            // 更新LayerNorm缓存
-            // 找LRU entry
-            lru_idx = 2'b00;
-            max_lru = ln_cache_lru[0];
-            for (i = 1; i < 4; i = i + 1) begin
-                if (ln_cache_lru[i] > max_lru) begin
-                    max_lru = ln_cache_lru[i];
-                    lru_idx = i[1:0];
-                end
-            end
-            
-            ln_cache_valid[lru_idx] <= 1'b1;
-            ln_cache_type[lru_idx] <= serving_type;
-            ln_cache_layer[lru_idx] <= serving_layer;
-            ln_cache_exp[lru_idx] <= dma_rcv_ln_exp;
-            ln_cache_mant[lru_idx] <= dma_rcv_ln_mant;
-            ln_cache_lru[lru_idx] <= 2'b00;
-            
-            // 增加其他entry的LRU计数
-            for (i = 0; i < 4; i = i + 1) begin
-                if (i != lru_idx && ln_cache_lru[i] < 2'b11) begin
-                    ln_cache_lru[i] <= ln_cache_lru[i] + 2'b01;
-                end
-            end
-            
-        end else begin
-            // 更新权重矩阵缓存
-            // 找LRU entry
-            lru_idx = 2'b00;
-            max_lru = weight_cache_lru[0];
-            for (i = 1; i < 4; i = i + 1) begin
-                if (weight_cache_lru[i] > max_lru) begin
-                    max_lru = weight_cache_lru[i];
-                    lru_idx = i[1:0];
-                end
-            end
-            
-            weight_cache_valid[lru_idx] <= 1'b1;
-            weight_cache_type[lru_idx] <= serving_type;
-            weight_cache_chunk_id[lru_idx] <= serving_chunk_id;
-            weight_cache_layer[lru_idx] <= serving_layer;
-            weight_cache_exp_array[lru_idx] <= dma_rcv_exp_array;
-            weight_cache_mant_blocks[lru_idx] <= dma_rcv_mant_blocks;
-            weight_cache_lru[lru_idx] <= 2'b00;
-            
-            // 增加其他entry的LRU计数
-            for (i = 0; i < 4; i = i + 1) begin
-                if (i != lru_idx && weight_cache_lru[i] < 2'b11) begin
-                    weight_cache_lru[i] <= weight_cache_lru[i] + 2'b01;
-                end
-            end
-        end
-    end
-end
-
-//================================================================================
-// 响应逻辑
+// 缓存更新逻辑
 //================================================================================
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        qkv_weight_ack <= 1'b0;
-        qkv_weight_valid <= 1'b0;
-        wo_weight_ready <= 1'b0;
-        ffn_weight_ready <= 1'b0;
-        ln_param_valid <= 1'b0;
-        
-        qkv_weight_exp_array <= {32*EXP_WIDTH{1'b0}};
-        qkv_weight_mant_blocks <= {32*32*DATA_WIDTH{1'b0}};
-        wo_weight_exp_array <= {32*EXP_WIDTH{1'b0}};
-        wo_weight_mant <= {32*32*DATA_WIDTH{1'b0}};
-        ffn_weight_exp_array <= {32*EXP_WIDTH{1'b0}};
-        ffn_weight_mant <= {32*32*DATA_WIDTH{1'b0}};
-        ln_param_exp <= {EXP_WIDTH{1'b0}};
-        ln_param_mant <= {DIM*DATA_WIDTH{1'b0}};
-        
-        dbg_cache_hit_count <= 32'h0;
+        for (i = 0; i < CACHE_ENTRIES; i = i + 1) begin
+            weight_cache_valid[i] <= 1'b0;
+            weight_cache_type[i]  <= 4'h0;
+            weight_cache_chunk_id[i] <= 2'b00;
+            weight_cache_layer[i] <= 2'b00;
+            weight_cache_exp_array[i] <= {32*EXP_WIDTH{1'b0}};
+            weight_cache_mant_blocks[i] <= {32*32*DATA_WIDTH{1'b0}};
+            weight_cache_age[i] <= 32'h0;
+            
+            ln_cache_valid[i] <= 1'b0;
+            ln_cache_type[i]  <= 4'h0;
+            ln_cache_layer[i] <= 2'b00;
+            ln_cache_exp[i]   <= {EXP_WIDTH{1'b0}};
+            ln_cache_mant[i]  <= {DIM*DATA_WIDTH{1'b0}};
+        end
+        dbg_cache_miss_count <= 32'h0;
     end else begin
-        // 默认清除ready/valid信号
-        qkv_weight_ack <= 1'b0;
-        qkv_weight_valid <= 1'b0;
-        wo_weight_ready <= 1'b0;
+        if (state == CHECK_CACHE && !weight_cache_hit && !ln_cache_hit &&
+            next_state == CALC_ADDR) begin
+            dbg_cache_miss_count <= dbg_cache_miss_count + 1;
+        end
+        
+        if (state == CHECK_CACHE || state == RESPOND) begin
+            for (i = 0; i < CACHE_ENTRIES; i = i + 1) begin
+                if ((weight_cache_valid[i] && weight_cache_hit && weight_cache_hit_index != i[1:0]) ||
+                    (ln_cache_valid[i]     && ln_cache_hit     && ln_cache_hit_index     != i[1:0])) begin
+                    weight_cache_age[i] <= weight_cache_age[i] + 1;
+                end
+            end
+        end
+        
+        if (state == CACHE_UPDATE) begin
+            if (serving_type <= 4'h5) begin:t1
+                integer min_index;
+                reg [31:0] min_age;
+                min_age = 32'hFFFF_FFFF;
+                min_index = 0;
+                for (i = 0; i < CACHE_ENTRIES; i = i + 1) begin
+                    if (!weight_cache_valid[i]) begin
+                        min_index = i;
+                        min_age = 32'h0;
+                    end else if (weight_cache_age[i] < min_age) begin
+                        min_index = i;
+                        min_age = weight_cache_age[i];
+                    end
+                end
+                
+                weight_cache_valid[min_index] <= 1'b1;
+                weight_cache_type[min_index]  <= serving_type;
+                weight_cache_chunk_id[min_index] <= serving_chunk_id;
+                weight_cache_layer[min_index] <= serving_layer;
+                weight_cache_exp_array[min_index] <= dma_rcv_exp_array;
+                weight_cache_mant_blocks[min_index] <= dma_rcv_mant_blocks;
+                weight_cache_age[min_index] <= 32'h0;
+            end else begin:t2
+                integer min_index_ln;
+                reg [31:0] min_age_ln;
+                min_age_ln = 32'hFFFF_FFFF;
+                min_index_ln = 0;
+                for (i = 0; i < CACHE_ENTRIES; i = i + 1) begin
+                    if (!ln_cache_valid[i]) begin
+                        min_index_ln = i;
+                        min_age_ln = 32'h0;
+                    end else if (weight_cache_age[i] < min_age_ln) begin
+                        min_index_ln = i;
+                        min_age_ln = weight_cache_age[i];
+                    end
+                end
+                
+                ln_cache_valid[min_index_ln] <= 1'b1;
+                ln_cache_type[min_index_ln]  <= serving_type;
+                ln_cache_layer[min_index_ln] <= serving_layer;
+                ln_cache_exp[min_index_ln]   <= dma_rcv_ln_exp;
+                ln_cache_mant[min_index_ln]  <= dma_rcv_ln_mant;
+                weight_cache_age[min_index_ln] <= 32'h0;
+            end
+        end
+    end
+end
+
+//================================================================================
+// 响应逻辑（这里已经修正 QKV 的 ack/valid 握手）
+//================================================================================
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        qkv_weight_ack        <= 1'b0;
+        qkv_weight_valid      <= 1'b0;
+        wo_weight_ready       <= 1'b0;
+        ffn_weight_ready      <= 1'b0;
+        ln_param_valid        <= 1'b0;
+        
+        qkv_weight_exp_array      <= {32*EXP_WIDTH{1'b0}};
+        qkv_weight_mant_blocks    <= {32*32*DATA_WIDTH{1'b0}};
+        wo_weight_exp_array       <= {32*EXP_WIDTH{1'b0}};
+        wo_weight_mant            <= {32*32*DATA_WIDTH{1'b0}};
+        ffn_weight_exp_array      <= {32*EXP_WIDTH{1'b0}};
+        ffn_weight_mant           <= {32*32*DATA_WIDTH{1'b0}};
+        ln_param_exp              <= {EXP_WIDTH{1'b0}};
+        ln_param_mant             <= {DIM*DATA_WIDTH{1'b0}};
+        
+        dbg_cache_hit_count       <= 32'h0;
+    end else begin
+        // 默认清除 ready/ready 型握手信号；valid 采用保持型
+        qkv_weight_ack   <= 1'b0;
+        wo_weight_ready  <= 1'b0;
         ffn_weight_ready <= 1'b0;
-        ln_param_valid <= 1'b0;
+        ln_param_valid   <= 1'b0;
+        
+        // 当检测到新的 QKV 请求时，清除上一轮的 valid
+        if (qkv_weight_req) begin
+            qkv_weight_valid <= 1'b0;
+        end
         
         if (state == RESPOND) begin
             case (serving_requester)
                 REQ_QKV: begin
                     // QKV权重响应
-                    qkv_weight_ack <= 1'b1;
+                    qkv_weight_ack   <= 1'b1;
                     qkv_weight_valid <= 1'b1;
                     if (weight_cache_hit) begin
-                        qkv_weight_exp_array <= weight_cache_exp_array[weight_cache_hit_index];
+                        qkv_weight_exp_array   <= weight_cache_exp_array[weight_cache_hit_index];
                         qkv_weight_mant_blocks <= weight_cache_mant_blocks[weight_cache_hit_index];
-                        dbg_cache_hit_count <= dbg_cache_hit_count + 1;
+                        dbg_cache_hit_count    <= dbg_cache_hit_count + 1;
                     end else begin
-                        qkv_weight_exp_array <= dma_rcv_exp_array;
+                        qkv_weight_exp_array   <= dma_rcv_exp_array;
                         qkv_weight_mant_blocks <= dma_rcv_mant_blocks;
                     end
                 end
@@ -644,11 +632,11 @@ always @(posedge clk or negedge rst_n) begin
                     wo_weight_ready <= 1'b1;
                     if (weight_cache_hit) begin
                         wo_weight_exp_array <= weight_cache_exp_array[weight_cache_hit_index];
-                        wo_weight_mant <= weight_cache_mant_blocks[weight_cache_hit_index];
+                        wo_weight_mant      <= weight_cache_mant_blocks[weight_cache_hit_index];
                         dbg_cache_hit_count <= dbg_cache_hit_count + 1;
                     end else begin
                         wo_weight_exp_array <= dma_rcv_exp_array;
-                        wo_weight_mant <= dma_rcv_mant_blocks;
+                        wo_weight_mant      <= dma_rcv_mant_blocks;
                     end
                 end
                 
@@ -657,11 +645,11 @@ always @(posedge clk or negedge rst_n) begin
                     ffn_weight_ready <= 1'b1;
                     if (weight_cache_hit) begin
                         ffn_weight_exp_array <= weight_cache_exp_array[weight_cache_hit_index];
-                        ffn_weight_mant <= weight_cache_mant_blocks[weight_cache_hit_index];
-                        dbg_cache_hit_count <= dbg_cache_hit_count + 1;
+                        ffn_weight_mant      <= weight_cache_mant_blocks[weight_cache_hit_index];
+                        dbg_cache_hit_count  <= dbg_cache_hit_count + 1;
                     end else begin
                         ffn_weight_exp_array <= dma_rcv_exp_array;
-                        ffn_weight_mant <= dma_rcv_mant_blocks;
+                        ffn_weight_mant      <= dma_rcv_mant_blocks;
                     end
                 end
                 
@@ -669,17 +657,16 @@ always @(posedge clk or negedge rst_n) begin
                     // LayerNorm参数响应
                     ln_param_valid <= 1'b1;
                     if (ln_cache_hit) begin
-                        ln_param_exp <= ln_cache_exp[ln_cache_hit_index];
+                        ln_param_exp  <= ln_cache_exp[ln_cache_hit_index];
                         ln_param_mant <= ln_cache_mant[ln_cache_hit_index];
                         dbg_cache_hit_count <= dbg_cache_hit_count + 1;
                     end else begin
-                        ln_param_exp <= dma_rcv_ln_exp;
+                        ln_param_exp  <= dma_rcv_ln_exp;
                         ln_param_mant <= dma_rcv_ln_mant;
                     end
                 end
                 
                 default: begin
-                    // 无操作
                 end
             endcase
         end
@@ -702,21 +689,8 @@ always @(posedge clk) begin
                              $time, serving_type, serving_chunk_id, serving_layer);
             REQ_LN:  $display("[%0t] Weight Controller: Serving LN type=%0h layer=%0d", 
                              $time, serving_type, serving_layer);
+            default: ;
         endcase
-    end
-    
-    if (state == CHECK_CACHE) begin
-        if (weight_cache_hit) begin
-            $display("[%0t] Weight Controller: Cache HIT (weight matrix)", $time);
-        end else if (ln_cache_hit) begin
-            $display("[%0t] Weight Controller: Cache HIT (layernorm)", $time);
-        end else begin
-            $display("[%0t] Weight Controller: Cache MISS - DMA loading", $time);
-        end
-    end
-    
-    if (state == RESPOND) begin
-        $display("[%0t] Weight Controller: Response sent", $time);
     end
 end
 `endif
