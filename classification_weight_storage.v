@@ -9,20 +9,7 @@
 // 存储内容：
 //   • 权重W: [DIM × 1] = 32个权重值（Q4.12格式）
 //   • 偏置b: 1个偏置值（Q4.12格式）
-//
-// 接口：
-//   • 读接口：用于前向传播（分类计算）
-//   • 写接口：用于训练更新
-//   • 初始化接口：可选的初始化功能
-//
-// 性能：
-//   • 读延迟：0 cycle（组合逻辑）
-//   • 写延迟：1 cycle
-//
-// 作者：MEIGA Team
-// 日期：2025-11-19
-// 版本：v1.0
-//================================================================================
+`timescale 1ns / 1ps
 
 module classification_weight_storage #(
     parameter DIM = 32,              // 特征维度
@@ -33,7 +20,7 @@ module classification_weight_storage #(
     // 时钟和复位
     //==========================================================================
     input  wire clk,
-    input  wire rst_n,
+    input  wire rst_n,               // 复位仅用于调试计数器，不影响权重存储
     
     //==========================================================================
     // 初始化接口（配置初始权重）
@@ -50,8 +37,8 @@ module classification_weight_storage #(
     // 读接口（只读，用于前向传播）
     //==========================================================================
     input  wire [DIM_ADDR_WIDTH-1:0] rd_addr,    // 读地址（0-31）
-    output wire [DATA_WIDTH-1:0] rd_data,         // 权重W[addr]
-    output wire [DATA_WIDTH-1:0] bias,            // 偏置b
+    output wire [DATA_WIDTH-1:0] rd_data,        // 权重W[addr]
+    output wire [DATA_WIDTH-1:0] bias,           // 偏置b
     
     //==========================================================================
     // 调试接口
@@ -63,30 +50,23 @@ module classification_weight_storage #(
 //================================================================================
 // 权重存储（寄存器数组）
 //================================================================================
+//未复位时，仿真中这些值为 X (不定态)，硬件中为随机值
 reg [DATA_WIDTH-1:0] weights [0:DIM-1];
 reg [DATA_WIDTH-1:0] bias_reg;
 
 //================================================================================
-// 初始化逻辑
+// 初始化逻辑 (无依靠写入覆盖)
 //================================================================================
-integer i;
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        // 复位：全部清零
-        for (i = 0; i < DIM; i = i + 1) begin
-            weights[i] <= 16'sd0;
-        end
-        bias_reg <= 16'sd0;
-        dbg_init_count <= 32'd0;
-    end else begin
-        // 初始化权重（逐个配置）
-        if (init_en) begin
-            weights[init_addr] <= init_data;
-            dbg_init_count <= dbg_init_count + 1;
-        end
+always @(posedge clk) begin
+    // 移除了 if (!rst_n) 分支
+    // 只有在 init_en 有效时才改变存储内容
+    
+    if (init_en) begin
+        weights[init_addr] <= init_data;
         
-        // 初始化偏置
-        if (init_bias_en) begin
+        // 优化：仅在加载地址0时更新偏置
+        // 防止每次加载权重时都重复写入偏置寄存器
+        if (init_bias_en && (init_addr == 5'd0)) begin
             bias_reg <= init_bias;
         end
     end
@@ -99,18 +79,21 @@ assign rd_data = weights[rd_addr];
 assign bias = bias_reg;
 
 //================================================================================
-// 调试计数器
+// 调试计数器 (保留复位)
 //================================================================================
-
-
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
+        dbg_init_count <= 32'd0;
         dbg_read_count <= 32'd0;
     end else begin
-        // 统计读操作（每个时钟周期可能有读取）
+        // 统计初始化次数
+        if (init_en) begin
+            dbg_init_count <= dbg_init_count + 1;
+        end
+        
+        // 统计读操作 (每个周期都在读，简单自增)
         dbg_read_count <= dbg_read_count + 1;
     end
 end
-
 
 endmodule
