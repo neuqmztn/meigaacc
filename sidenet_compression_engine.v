@@ -18,7 +18,7 @@
 //================================================================================
 
 module sidenet_compression_engine #(
-    parameter TOKEN_NUM      = 641,       // 总token数
+    parameter TOKEN_NUM      = 640,       // 总token数
     parameter TOKEN_BATCH    = 32,        // 每批处理的token数（保留，实际逐个）
     parameter INPUT_DIM      = 32,        // 输入维度
     parameter OUTPUT_DIM     = 8,         // 输出维度（压缩后）
@@ -61,7 +61,7 @@ module sidenet_compression_engine #(
     input  wire [INPUT_DIM*OUTPUT_DIM*DATA_WIDTH-1:0] weight_mant,  // 32×8×16
     
     //============================================================================
-    // 压缩结果输出 - 写入Compressed Buffer
+    // 压缩结果输出 
     //============================================================================
     output reg  result_wr_en,
     output reg  [ADDR_WIDTH-1:0] result_wr_addr,
@@ -452,7 +452,6 @@ compute_engine #(
     
     // 数据位宽
     .EXP_WIDTH(EXP_WIDTH),            // 指数8位
-    .MANT_WIDTH(DATA_WIDTH),          // 保留参数（兼容性）
     .INPUT_MANT_WIDTH(DATA_WIDTH),    // 输入尾数16位
     
     // 向量维度
@@ -464,10 +463,8 @@ compute_engine #(
     .INTERNAL_WIDTH(CE_INTERNAL_WIDTH),     // 内部39位
     .OUTPUT_WIDTH(CE_OUTPUT_WIDTH),         // 输出32位
     .GUARD_BITS(CE_GUARD_BITS),             // 保护位7位
-    .ENABLE_ROUNDING(CE_ENABLE_ROUNDING),   // 启用舍入
+    .ENABLE_ROUNDING(CE_ENABLE_ROUNDING)  // 启用舍入
     
-    // FIFO配置
-    .FIFO_DEPTH(16)                   // FIFO深度
 ) u_compute_engine (
     .clk(clk),
     .rst_n(rst_n),
@@ -484,8 +481,7 @@ compute_engine #(
     //--------------------------------------------------------------------------
     .exp_X(token_exp_buf),            // Token的共享指数（1个，8位）
     .mant_X_block(token_mant_buf),    // Token的尾数（32×16位）
-    
-    // ✅ 权重：8个独立共享指数 + 尾数矩阵
+
     .exp_W_array(weight_exp_buf),     // 8个共享指数（8×8 = 64位）
     .mant_W_blocks(weight_mant_buf),  // 权重尾数（32×8×16位）
     
@@ -496,7 +492,7 @@ compute_engine #(
     .result_ready(1'b1),              // 始终就绪（直接连转换器）
     
     //--------------------------------------------------------------------------
-    // ✅ 输出数据（定点格式）
+    // 输出数据
     //--------------------------------------------------------------------------
     .result_fixed_array(ce_result_fixed_array),      // 定点累加结果（8×32位）
     .result_base_exp_array(ce_result_base_exp_array),// 基础指数（8×9位）

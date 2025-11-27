@@ -1,33 +1,31 @@
 `timescale 1ns / 1ps
 //==============================================================
-// PE_D 数据打包器：2个INT16元素
+// PE_D 数据打包器：2个 INT16 元素 → 单 PE，4MAC
 //==============================================================
 
 module data_packer_PE_D (
-    // 向量输入：2个16bit元素
-    input  wire [31:0] mant_X_vec,  // 2×16 = 32bit
-    input  wire [31:0] mant_W_vec,
-    
-    // 打包输出：4×64bit
-    output wire [63:0] x_data_a_packed,
-    output wire [63:0] x_data_b_packed,
-    output wire [63:0] w_data_a_packed,
-    output wire [63:0] w_data_b_packed
+    // 向量输入：2 个 16bit 元素
+    input  wire [2*16-1:0] mant_X_vec,  // a0 在 [15:0]，a1 在 [31:16]
+    input  wire [2*16-1:0] mant_W_vec,  // b0 在 [15:0]，b1 在 [31:16]
+
+    // 打包输出：4 MAC，32bit
+    output wire [31:0] x_data_a_packed,
+    output wire [31:0] x_data_b_packed,
+    output wire [31:0] w_data_a_packed,
+    output wire [31:0] w_data_b_packed
 );
 
-// 解包
-wire [15:0] X0, X1;
-wire [15:0] W0, W1;
+    wire [15:0] a0 = mant_X_vec[15:0];
+    wire [15:0] a1 = mant_X_vec[31:16];
 
-assign X0 = mant_X_vec[15:0];
-assign X1 = mant_X_vec[31:16];
-assign W0 = mant_W_vec[15:0];
-assign W1 = mant_W_vec[31:16];
+    wire [15:0] b0 = mant_W_vec[15:0];
+    wire [15:0] b1 = mant_W_vec[31:16];
 
-// 打包：高32bit为0，低32bit为重复的高低8bit
-assign x_data_a_packed = {32'h0, X0[15:8], X0[15:8], X0[7:0], X0[7:0]};
-assign x_data_b_packed = {32'h0, X1[15:8], X1[15:8], X1[7:0], X1[7:0]};
-assign w_data_a_packed = {32'h0, W0[15:8], W0[7:0], W0[15:8], W0[7:0]};
-assign w_data_b_packed = {32'h0, W1[15:8], W1[7:0], W1[15:8], W1[7:0]};
+
+    assign x_data_a_packed = { a0[15:8], a0[15:8], a0[7:0], a0[7:0] };
+    assign x_data_b_packed = { a1[15:8], a1[15:8], a1[7:0], a1[7:0] };
+
+    assign w_data_a_packed = { b0[15:8], b0[7:0],  b0[15:8], b0[7:0] };
+    assign w_data_b_packed = { b1[15:8], b1[7:0],  b1[15:8], b1[7:0] };
 
 endmodule

@@ -31,14 +31,14 @@ module sidenet_layer_output_buffer #(
     //==========================================================================
     // 基本参数
     //==========================================================================
-    parameter TOKEN_NUM      = 641,         // Token数量
+    parameter TOKEN_NUM      = 640,         // Token数量
     parameter DIM_L0_L3      = 8,           // Layer 0-3维度
     parameter DIM_L4         = 32,          // Layer 4维度（Expand）
     parameter DATA_WIDTH     = 16,          // 尾数位宽 (16-bit BFP)
     parameter EXP_WIDTH      = 8,           // 指数位宽
     parameter NUM_LAYERS     = 5,           // 层数 (Layer 0-4)
     parameter ADDR_WIDTH     = 10,          // Token地址位宽
-    parameter LAYER_WIDTH    = 3            // Layer地址位宽 (0-4)
+    parameter LAYER_WIDTH    = 4           // Layer地址位宽 (0-4)
 )(
     //==========================================================================
     // 时钟和复位
@@ -213,23 +213,23 @@ always @(posedge clk or negedge rst_n) begin
     end 
     else if (wr_en && !wr_error) begin
         case (wr_layer_id)
-            3'd0: begin
+            4'd0: begin
                 exp_bank0[wr_token_id]  <= wr_exp;
                 mant_bank0[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
             end
-            3'd1: begin
+            4'd1: begin
                 exp_bank1[wr_token_id]  <= wr_exp;
                 mant_bank1[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
             end
-            3'd2: begin
+            4'd2: begin
                 exp_bank2[wr_token_id]  <= wr_exp;
                 mant_bank2[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
             end
-            3'd3: begin
+            4'd3: begin
                 exp_bank3[wr_token_id]  <= wr_exp;
                 mant_bank3[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
             end
-            3'd4: begin
+            6'd4: begin
                 exp_bank4[wr_token_id]  <= wr_exp;
                 mant_bank4[wr_token_id] <= wr_mant[MANT_WIDTH_L4-1:0];
             end

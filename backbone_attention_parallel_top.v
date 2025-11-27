@@ -348,7 +348,8 @@ qkv_compute_engine #(
     .kv_wr_mant(kv_cache_wr_mant),
     
     // 状态输出
-    .all_kv_written()
+    .all_kv_written(),
+    .error()
 );
 
 //===================================================================================

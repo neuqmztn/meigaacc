@@ -128,7 +128,19 @@ module sidenet_weight_storage #(
     //==========================================================================
     output wire [31:0] dbg_read_count,
     output wire [31:0] dbg_write_count,
-    output wire [31:0] dbg_bank_swap_count
+    output wire [31:0] dbg_bank_swap_count,
+
+    //==========================================================================
+    // DFA / WUE 按元素读接口（只读当前 read bank）
+    //==========================================================================
+    input  wire        dfa_rd_en,
+    input  wire [2:0]  dfa_rd_layer_id,
+    input  wire [3:0]  dfa_rd_weight_type,
+    input  wire [4:0]  dfa_rd_col_id,   // 0..31
+    input  wire [4:0]  dfa_rd_row_id,   // 0..31
+    output reg         dfa_rd_valid,
+    output reg  [EXP_WIDTH-1:0]  dfa_rd_exp,
+    output reg  [DATA_WIDTH-1:0] dfa_rd_mant
 );
 
 //================================================================================
@@ -579,6 +591,263 @@ always @(posedge clk or negedge rst_n) begin
         end
     end
 end
+//================================================================================
+// DFA / WUE 按元素读逻辑
+// - 根据 (dfa_rd_layer_id, dfa_rd_weight_type, dfa_rd_col_id, dfa_rd_row_id)
+//   从当前 read bank 读取单个权重的 BFP (exp, mant)
+//================================================================================
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        dfa_rd_valid <= 1'b0;
+        dfa_rd_exp   <= {EXP_WIDTH{1'b0}};
+        dfa_rd_mant  <= {DATA_WIDTH{1'b0}};
+    end else begin
+        dfa_rd_valid <= 1'b0;
+        dfa_rd_exp   <= {EXP_WIDTH{1'b0}};
+        dfa_rd_mant  <= {DATA_WIDTH{1'b0}};
+
+        if (dfa_rd_en) begin
+            dfa_rd_valid <= 1'b1;
+
+            // 默认清零，防止case没命中
+            dfa_rd_exp   <= {EXP_WIDTH{1'b0}};
+            dfa_rd_mant  <= {DATA_WIDTH{1'b0}};
+
+            // 选择当前读BANK
+            if (current_read_bank == 1'b0) begin
+                //==========================
+                //        BANK A
+                //==========================
+                case (dfa_rd_layer_id)
+                    //======================================================
+                    // Layer 0
+                    //======================================================
+                    3'd0: begin
+                        case (dfa_rd_weight_type)
+                            // Layer 0 - Compression (32×8)
+                            WEIGHT_COMPRESS: begin
+                                // 列指数
+                                dfa_rd_exp <= bank_a_l0_compress_exp[dfa_rd_col_id[2:0]];
+                                // 行权重: 2 个 burst, 每个 16 行
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_a_l0_compress_col
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_a_l0_compress_col
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            default: begin
+                                dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                                dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                            end
+                        endcase
+                    end
+
+                    //======================================================
+                    // Layer 1-3
+                    //======================================================
+                    3'd1, 3'd2, 3'd3: begin
+                        case (dfa_rd_weight_type)
+                            // Layer 1-3 - Compression (32×8)
+                            WEIGHT_COMPRESS: begin
+                                dfa_rd_exp <= bank_a_l13_compress_exp
+                                              [dfa_rd_layer_id-1][dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_a_l13_compress_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_a_l13_compress_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            // Layer 1-3 - FFN W1 (8×32)
+                            WEIGHT_FFN_W1: begin
+                                // 列指数：32 列
+                                dfa_rd_exp <= bank_a_l13_ffn_w1_exp
+                                              [dfa_rd_layer_id-1][dfa_rd_col_id[4:0]];
+                                // 行：8 行，对应 idx 0..7
+                                dfa_rd_mant <= bank_a_l13_ffn_w1_col
+                                               [dfa_rd_layer_id-1]
+                                               [dfa_rd_col_id[4:0]][dfa_rd_row_id[2:0]];
+                            end
+
+                            // Layer 1-3 - FFN W2 (32×8)
+                            WEIGHT_FFN_W2: begin
+                                dfa_rd_exp <= bank_a_l13_ffn_w2_exp
+                                              [dfa_rd_layer_id-1][dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_a_l13_ffn_w2_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_a_l13_ffn_w2_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            default: begin
+                                dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                                dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                            end
+                        endcase
+                    end
+
+                    //======================================================
+                    // Layer 4
+                    //======================================================
+                    3'd4: begin
+                        case (dfa_rd_weight_type)
+                            // Layer 4 - Compression (32×8)
+                            WEIGHT_COMPRESS: begin
+                                dfa_rd_exp <= bank_a_l4_compress_exp[dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_a_l4_compress_col
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_a_l4_compress_col
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            // Layer 4 - Expand (8×32)
+                            WEIGHT_EXPAND: begin
+                                dfa_rd_exp <= bank_a_l4_expand_exp[dfa_rd_col_id[4:0]];
+                                dfa_rd_mant <= bank_a_l4_expand_col
+                                               [dfa_rd_col_id[4:0]][dfa_rd_row_id[2:0]];
+                            end
+
+                            default: begin
+                                dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                                dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                            end
+                        endcase
+                    end
+
+                    default: begin
+                        dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                        dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                    end
+                endcase
+            end else begin
+                //==========================
+                //        BANK B
+                //==========================
+                case (dfa_rd_layer_id)
+                    //======================================================
+                    // Layer 0
+                    //======================================================
+                    3'd0: begin
+                        case (dfa_rd_weight_type)
+                            WEIGHT_COMPRESS: begin
+                                dfa_rd_exp <= bank_b_l0_compress_exp[dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_b_l0_compress_col
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_b_l0_compress_col
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            default: begin
+                                dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                                dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                            end
+                        endcase
+                    end
+
+                    //======================================================
+                    // Layer 1-3
+                    //======================================================
+                    3'd1, 3'd2, 3'd3: begin
+                        case (dfa_rd_weight_type)
+                            WEIGHT_COMPRESS: begin
+                                dfa_rd_exp <= bank_b_l13_compress_exp
+                                              [dfa_rd_layer_id-1][dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_b_l13_compress_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_b_l13_compress_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            WEIGHT_FFN_W1: begin
+                                dfa_rd_exp <= bank_b_l13_ffn_w1_exp
+                                              [dfa_rd_layer_id-1][dfa_rd_col_id[4:0]];
+                                dfa_rd_mant <= bank_b_l13_ffn_w1_col
+                                               [dfa_rd_layer_id-1]
+                                               [dfa_rd_col_id[4:0]][dfa_rd_row_id[2:0]];
+                            end
+
+                            WEIGHT_FFN_W2: begin
+                                dfa_rd_exp <= bank_b_l13_ffn_w2_exp
+                                              [dfa_rd_layer_id-1][dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_b_l13_ffn_w2_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_b_l13_ffn_w2_col
+                                                   [dfa_rd_layer_id-1]
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            default: begin
+                                dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                                dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                            end
+                        endcase
+                    end
+
+                    //======================================================
+                    // Layer 4
+                    //======================================================
+                    3'd4: begin
+                        case (dfa_rd_weight_type)
+                            WEIGHT_COMPRESS: begin
+                                dfa_rd_exp <= bank_b_l4_compress_exp[dfa_rd_col_id[2:0]];
+                                if (dfa_rd_row_id[4] == 1'b0) begin
+                                    dfa_rd_mant <= bank_b_l4_compress_col
+                                                   [dfa_rd_col_id[2:0]][0][dfa_rd_row_id[3:0]];
+                                end else begin
+                                    dfa_rd_mant <= bank_b_l4_compress_col
+                                                   [dfa_rd_col_id[2:0]][1][dfa_rd_row_id[3:0]];
+                                end
+                            end
+
+                            WEIGHT_EXPAND: begin
+                                dfa_rd_exp  <= bank_b_l4_expand_exp[dfa_rd_col_id[4:0]];
+                                dfa_rd_mant <= bank_b_l4_expand_col
+                                               [dfa_rd_col_id[4:0]][dfa_rd_row_id[2:0]];
+                            end
+
+                            default: begin
+                                dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                                dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                            end
+                        endcase
+                    end
+
+                    default: begin
+                        dfa_rd_exp  <= {EXP_WIDTH{1'b0}};
+                        dfa_rd_mant <= {DATA_WIDTH{1'b0}};
+                    end
+                endcase
+            end
+        end
+    end
+end
 
 //================================================================================
 // 写逻辑 - 写入备用BANK
@@ -866,62 +1135,4 @@ end
 // - 使用dma_init_data直接写入，不区分指数和数据
 //   (调用者需要先传指数burst，再传数据burst)
 //================================================================================
-
-// DMA逻辑暂时省略，可以参考写逻辑实现
-
-//================================================================================
-// 调试信息
-//================================================================================
-
-`ifdef SIMULATION
-initial begin
-    $display("================================================");
-    $display("Sidenet Weight Storage v3.0");
-    $display("================================================");
-    $display("Key Features:");
-    $display("  - Column-major storage for parallel PU access");
-    $display("  - Multi-exponent BFP: one exp per output dim");
-    $display("  - Batch read/write (256-bit bursts)");
-    $display("  - Dual-BANK ping-pong for training");
-    $display("================================================");
-    $display("Storage Organization:");
-    $display("  Compression 32x8:  8 cols x 2 bursts = 16");
-    $display("  Attention 8x8:     8 cols x 1 burst  = 8");
-    $display("  Expand 8x32:      32 cols x 1 burst  = 32");
-    $display("================================================");
-    $display("Burst Indexing (Compression example):");
-    $display("  Burst 0-1:   Col 0 (burst_idx[3:1]=0)");
-    $display("  Burst 2-3:   Col 1 (burst_idx[3:1]=1)");
-    $display("  ...");
-    $display("  Burst 14-15: Col 7 (burst_idx[3:1]=7)");
-    $display("================================================");
-end
-
-// 监控读操作
-always @(posedge clk) begin
-    if (rd_en && rd_valid) begin
-        $display("[%0t] RD: L%0d T%0d B%0d Bank=%s", 
-                 $time, rd_layer_id, rd_weight_type, rd_burst_idx,
-                 current_read_bank ? "B" : "A");
-    end
-end
-
-// 监控写操作
-always @(posedge clk) begin
-    if (wr_en && wr_ready) begin
-        $display("[%0t] WR: L%0d T%0d B%0d Bank=%s", 
-                 $time, wr_layer_id, wr_weight_type, wr_burst_idx,
-                 current_write_bank ? "B" : "A");
-    end
-end
-
-// 监控BANK切换
-always @(posedge bank_swap) begin
-    $display("[%0t] BANK SWAP: Read=%s Write=%s", 
-             $time,
-             current_read_bank ? "B" : "A",
-             current_write_bank ? "B" : "A");
-end
-`endif
-
 endmodule

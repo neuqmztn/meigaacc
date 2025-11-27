@@ -175,11 +175,11 @@ sidenet_compression_engine #(
     .busy(compress_busy),
     
     // Backbone读接口
-    .input_rd_en(backbone_rd_en),
-    .input_rd_addr(backbone_rd_addr),
-    .input_rd_exp(backbone_rd_exp),
-    .input_rd_mant(backbone_rd_mant),
-    .input_rd_valid(backbone_rd_valid),
+    .token_rd_en(backbone_rd_en),
+    .token_rd_addr(backbone_rd_addr),
+    .token_rd_exp(backbone_rd_exp),
+    .token_rd_mant(backbone_rd_mant),
+    .token_rd_valid(backbone_rd_valid),
     
     // 权重接口
     .weight_req(compress_weight_req),

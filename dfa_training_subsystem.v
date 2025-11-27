@@ -17,16 +17,24 @@
 // 设计理念：
 // • 完整封装DFA训练流程
 // • 内部控制器协调各模块
-// • 对外提供简单接口
+// • 对上层只暴露统一的训练接口
 //
-// 数据流：
-// error (来自分类系统) → 5×GCU → Gradient Buffer → Weight Update Engine → Sidenet Weights
+// 数据流概览：
+//
+//   Backbone (SideNet Layers)           DFA Training Subsystem
+//   ---------------------------         -----------------------------
+//   LOB Layer 0-4 activations  ----->   Gradient Compute Units (GCU 0-4)
+//                                         |             ↑
+//                                         v             |
+//                                     Gradient Buffer   |
+//                                         |             |
+//                                         v             |
+//                                   Weight Update Engine (WUE)
+//                                         |
+//                                         v
+//                                     Sidenet Weights
 //          ↑                        ↑
-//      B Matrix                Activation (LOB)
-//
-// 作者：MEIGA Team
-// 日期：2025-11-19
-// 版本：v2.0 (包含控制器)
+//    DFA Matrix Bank (B)        DFA Master Controller
 //================================================================================
 
 module dfa_training_subsystem #(
@@ -88,12 +96,12 @@ module dfa_training_subsystem #(
     output wire        capture_enable,
     
     //==========================================================================
-    // 误差输入接口（来自classification_subsystem）
+    // 误差计算接口（连接classification_subsystem）
     //==========================================================================
-    output wire        error_start,          // 启动误差计算
-    input  wire        error_done,           // 误差计算完成
-    input  wire        error_valid,          // 误差有效
-    input  wire [DATA_WIDTH-1:0] error_scalar,  // 误差标量
+    output wire        error_start,
+    input  wire        error_done,
+    input  wire        error_valid,
+    input  wire [DATA_WIDTH-1:0] error_scalar,
     
     //==========================================================================
     // LOB读取接口 - 连接到layer_token_buffer (Layer 0-4)
@@ -124,7 +132,12 @@ module dfa_training_subsystem #(
     input  wire        lob_dfa4_valid,
     
     //==========================================================================
-    // 权重存储接口 - 连接到sidenet_weight_storage
+    // B矩阵初始化接口（可选，连接到DRAM或配置模块）
+    //==========================================================================
+    input  wire        b_matrices_exist,     // 1: B矩阵已存在，无需初始化
+    
+    //==========================================================================
+    // 权重存储接口（连接到sidenet_weight_storage或统一权重控制模块）
     //==========================================================================
     output wire        weight_rd_req,
     output wire [2:0]  weight_rd_layer_id,
@@ -140,29 +153,31 @@ module dfa_training_subsystem #(
     output wire [3:0]  weight_wr_type,
     output wire [5:0]  weight_wr_burst_idx,
     output wire [MAX_EXP_ARRAY_WIDTH-1:0] weight_wr_exp_array,
-    output wire [DRAM_DATA_WIDTH-1:0] weight_wr_data_burst,
+    output wire [DRAM_DATA_WIDTH-1:0]     weight_wr_data_burst,
     input  wire        weight_wr_ready,
     
     //==========================================================================
-    // Bank切换接口
+    // Bank切换接口（可连接到Backbone/SideNet控制）
     //==========================================================================
     output wire        request_bank_switch,
     input  wire        bank_switch_ready,
-    output wire        confirm_switch,
-    input  wire        switch_complete,
     
     //==========================================================================
-    // 调试接口
+    // 调试输出
     //==========================================================================
-    output wire [3:0]  dbg_controller_state,
-    output wire [31:0] dbg_iteration_count,
-    output wire [7:0]  dbg_batch_count,
-    output wire [7:0]  dbg_epoch_count,
-    output wire        dbg_timeout_error,
-    output wire [2:0]  dbg_gcu0_state,
-    output wire [31:0] dbg_gcu0_cycles,
+    output wire [3:0]  dbg_ctrl_state,
+    output wire [3:0]  dbg_gcu0_state,
+    output wire [3:0]  dbg_gcu1_state,
+    output wire [3:0]  dbg_gcu2_state,
+    output wire [3:0]  dbg_gcu3_state,
+    output wire [3:0]  dbg_gcu4_state,
     output wire [3:0]  dbg_update_state,
-    output wire [31:0] dbg_update_count
+    output wire [31:0] dbg_update_count,
+    output wire [31:0] dbg_gcu0_cycles,
+    output wire [31:0] dbg_gcu1_cycles,
+    output wire [31:0] dbg_gcu2_cycles,
+    output wire [31:0] dbg_gcu3_cycles,
+    output wire [31:0] dbg_gcu4_cycles
 );
 
 //================================================================================
@@ -170,7 +185,8 @@ module dfa_training_subsystem #(
 //================================================================================
 wire        init_b_start;
 wire        init_b_done;
-wire        b_matrices_exist;
+wire        b_matrices_exist_internal;
+assign      b_matrices_exist_internal = b_matrices_exist;
 
 //================================================================================
 // 内部信号：控制器 → GCU
@@ -180,11 +196,25 @@ wire [4:0]  gcu_done;
 wire [4:0]  gcu_busy;
 
 //================================================================================
-// 内部信号：控制器 → 权重更新
+// 内部信号：控制器 → 权重更新（外层控制器视角）
 //================================================================================
-wire        update_start;
-wire        update_done;
+wire        ctrl_update_start;
+reg         ctrl_update_done;
 wire        update_busy;
+
+//================================================================================
+// 内部信号：多层权重更新调度
+// - ctrl_update_start / ctrl_update_done : 与 DFA Master Controller 握手
+// - wue_update_start / wue_update_done   : 与 Weight Update Engine 握手
+// - update_layer_id                      : 当前正在更新的 SideNet 层 ID
+//================================================================================
+reg  [2:0] update_layer_id;
+reg        update_seq_active;
+reg        wue_update_start_reg;
+wire       wue_update_start;
+wire       wue_update_done;
+
+assign wue_update_start = wue_update_start_reg;
 
 //================================================================================
 // 内部信号：B矩阵读取接口
@@ -201,8 +231,8 @@ wire        gcu0_b_valid, gcu1_b_valid, gcu2_b_valid, gcu3_b_valid, gcu4_b_valid
 //================================================================================
 wire        gcu0_grad_wr_en, gcu1_grad_wr_en, gcu2_grad_wr_en, gcu3_grad_wr_en, gcu4_grad_wr_en;
 wire [TOKEN_ADDR_WIDTH-1:0] gcu0_grad_token, gcu1_grad_token, gcu2_grad_token, gcu3_grad_token, gcu4_grad_token;
-wire [DIM_ADDR_WIDTH-1:0] gcu0_grad_dim, gcu1_grad_dim, gcu2_grad_dim, gcu3_grad_dim, gcu4_grad_dim;
-wire [DATA_WIDTH-1:0] gcu0_grad_data, gcu1_grad_data, gcu2_grad_data, gcu3_grad_data, gcu4_grad_data;
+wire [DIM_ADDR_WIDTH-1:0]   gcu0_grad_dim,   gcu1_grad_dim,   gcu2_grad_dim,   gcu3_grad_dim,   gcu4_grad_dim;
+wire [DATA_WIDTH-1:0]       gcu0_grad_data,  gcu1_grad_data,  gcu2_grad_data,  gcu3_grad_data,  gcu4_grad_data;
 
 //================================================================================
 // 内部信号：权重更新引擎 → 梯度缓存
@@ -215,16 +245,16 @@ wire        grad_rd_valid;
 wire [DATA_WIDTH-1:0] grad_rd_data;
 
 //================================================================================
-// 模块实例化：DFA Master Controller
+// DFA Master Controller 实例
 //================================================================================
 dfa_master_controller #(
-    .MAX_BATCH_SIZE(MAX_BATCH_SIZE),
-    .MAX_EPOCHS(MAX_EPOCHS),
-    .FORWARD_TIMEOUT(2000),
-    .ERROR_TIMEOUT(500),
-    .GRADIENT_TIMEOUT(25000),
-    .UPDATE_TIMEOUT(15000),
-    .BANK_SWITCH_DELAY(10),
+    .MAX_BATCH_SIZE   (MAX_BATCH_SIZE),
+    .MAX_EPOCHS       (MAX_EPOCHS),
+    .FORWARD_TIMEOUT  (16'd2000),
+    .ERROR_TIMEOUT    (16'd500),
+    .GRADIENT_TIMEOUT (32'd25000),
+    .UPDATE_TIMEOUT   (32'd15000),
+    .BANK_SWITCH_DELAY(16'd10),
     .GCU_PARALLEL_START(1)
 ) u_dfa_master_controller (
     .clk(clk),
@@ -238,7 +268,7 @@ dfa_master_controller #(
     .train_active(train_active),
     
     // B矩阵初始化
-    .b_matrices_exist(b_matrices_exist),
+    .b_matrices_exist(b_matrices_exist_internal),
     .init_b_matrices(init_b_start),
     .b_init_done(init_b_done),
     
@@ -256,28 +286,66 @@ dfa_master_controller #(
     .grad_start(gcu_start),
     .grad_done(gcu_done),
     
-    // 权重更新控制
-    .update_start(update_start),
-    .update_done(update_done),
+    // 权重更新控制（外层只看到一次update，对应内部5层顺序更新）
+    .update_start(ctrl_update_start),
+    .update_done(ctrl_update_done),
     
     // Bank切换
     .request_bank_switch(request_bank_switch),
     .bank_switch_ready(bank_switch_ready),
-    .confirm_switch(confirm_switch),
-    .switch_complete(switch_complete),
     
     // 调试
-    .current_state(dbg_controller_state),
-    .iteration_counter(dbg_iteration_count),
-    .batch_counter(dbg_batch_count),
-    .epoch_counter(dbg_epoch_count),
-    .total_samples(),
-    .timeout_error(dbg_timeout_error),
-    .timeout_counter()
+    .dbg_state(dbg_ctrl_state)
 );
 
 //================================================================================
-// 模块实例化：5个Gradient Compute Units
+// DFA Matrix Bank - B矩阵存储
+//================================================================================
+dfa_matrix_bank #(
+    .NUM_LAYERS(NUM_LAYERS),
+    .DIM_SMALL(DIM_SMALL),
+    .DIM_LARGE(DIM_LARGE),
+    .DATA_WIDTH(DATA_WIDTH)
+) u_dfa_matrix_bank (
+    .clk(clk),
+    .rst_n(rst_n),
+    
+    .init_start(init_b_start),
+    .init_done(init_b_done),
+    
+    .gcu0_rd_en(gcu0_b_rd_en),
+    .gcu0_row_addr(gcu0_b_row_addr),
+    .gcu0_col_addr(gcu0_b_col_addr),
+    .gcu0_data(gcu0_b_data),
+    .gcu0_valid(gcu0_b_valid),
+    
+    .gcu1_rd_en(gcu1_b_rd_en),
+    .gcu1_row_addr(gcu1_b_row_addr),
+    .gcu1_col_addr(gcu1_b_col_addr),
+    .gcu1_data(gcu1_b_data),
+    .gcu1_valid(gcu1_b_valid),
+    
+    .gcu2_rd_en(gcu2_b_rd_en),
+    .gcu2_row_addr(gcu2_b_row_addr),
+    .gcu2_col_addr(gcu2_b_col_addr),
+    .gcu2_data(gcu2_b_data),
+    .gcu2_valid(gcu2_b_valid),
+    
+    .gcu3_rd_en(gcu3_b_rd_en),
+    .gcu3_row_addr(gcu3_b_row_addr),
+    .gcu3_col_addr(gcu3_b_col_addr),
+    .gcu3_data(gcu3_b_data),
+    .gcu3_valid(gcu3_b_valid),
+    
+    .gcu4_rd_en(gcu4_b_rd_en),
+    .gcu4_row_addr(gcu4_b_row_addr),
+    .gcu4_col_addr(gcu4_b_col_addr),
+    .gcu4_data(gcu4_b_data),
+    .gcu4_valid(gcu4_b_valid)
+);
+
+//================================================================================
+// 模块实例化：5个 Gradient Compute Units
 //================================================================================
 
 // GCU 0 - Layer 0 (DIM=8)
@@ -343,8 +411,8 @@ gradient_compute_unit #(
     .grad_token_addr(gcu1_grad_token),
     .grad_dim_addr(gcu1_grad_dim),
     .grad_data(gcu1_grad_data),
-    .state(),
-    .cycle_count(),
+    .state(dbg_gcu1_state),
+    .cycle_count(dbg_gcu1_cycles),
     .token_count()
 );
 
@@ -377,8 +445,8 @@ gradient_compute_unit #(
     .grad_token_addr(gcu2_grad_token),
     .grad_dim_addr(gcu2_grad_dim),
     .grad_data(gcu2_grad_data),
-    .state(),
-    .cycle_count(),
+    .state(dbg_gcu2_state),
+    .cycle_count(dbg_gcu2_cycles),
     .token_count()
 );
 
@@ -411,8 +479,8 @@ gradient_compute_unit #(
     .grad_token_addr(gcu3_grad_token),
     .grad_dim_addr(gcu3_grad_dim),
     .grad_data(gcu3_grad_data),
-    .state(),
-    .cycle_count(),
+    .state(dbg_gcu3_state),
+    .cycle_count(dbg_gcu3_cycles),
     .token_count()
 );
 
@@ -445,98 +513,60 @@ gradient_compute_unit #(
     .grad_token_addr(gcu4_grad_token),
     .grad_dim_addr(gcu4_grad_dim),
     .grad_data(gcu4_grad_data),
-    .state(),
-    .cycle_count(),
+    .state(dbg_gcu4_state),
+    .cycle_count(dbg_gcu4_cycles),
     .token_count()
 );
 
 //================================================================================
-// 模块实例化：DFA Matrix Bank
-//================================================================================
-dfa_matrix_bank #(
-    .NUM_CLASSES(NUM_CLASSES),
-    .LAYER0_DIM(DIM_SMALL),
-    .LAYER4_DIM(DIM_LARGE),
-    .DATA_WIDTH(DATA_WIDTH)
-) u_dfa_matrix_bank (
-    .clk(clk),
-    .rst_n(rst_n),
-    .init_start(init_b_start),
-    .init_done(init_b_done),
-    .matrices_exist(b_matrices_exist),
-    .gcu0_rd_en(gcu0_b_rd_en),
-    .gcu0_row_addr(gcu0_b_row_addr),
-    .gcu0_col_addr(gcu0_b_col_addr),
-    .gcu0_data(gcu0_b_data),
-    .gcu0_valid(gcu0_b_valid),
-    .gcu1_rd_en(gcu1_b_rd_en),
-    .gcu1_row_addr(gcu1_b_row_addr),
-    .gcu1_col_addr(gcu1_b_col_addr),
-    .gcu1_data(gcu1_b_data),
-    .gcu1_valid(gcu1_b_valid),
-    .gcu2_rd_en(gcu2_b_rd_en),
-    .gcu2_row_addr(gcu2_b_row_addr),
-    .gcu2_col_addr(gcu2_b_col_addr),
-    .gcu2_data(gcu2_b_data),
-    .gcu2_valid(gcu2_b_valid),
-    .gcu3_rd_en(gcu3_b_rd_en),
-    .gcu3_row_addr(gcu3_b_row_addr),
-    .gcu3_col_addr(gcu3_b_col_addr),
-    .gcu3_data(gcu3_b_data),
-    .gcu3_valid(gcu3_b_valid),
-    .gcu4_rd_en(gcu4_b_rd_en),
-    .gcu4_row_addr(gcu4_b_row_addr),
-    .gcu4_col_addr(gcu4_b_col_addr),
-    .gcu4_data(gcu4_b_data),
-    .gcu4_valid(gcu4_b_valid),
-    .delta_rd_en(1'b0),
-    .delta_layer_id(3'd0),
-    .delta_row_addr(5'd0),
-    .delta_col_addr(4'd0),
-    .delta_data(),
-    .delta_valid(),
-    .init_state(),
-    .init_counter()
-);
-
-//================================================================================
-// 模块实例化：Gradient Buffer
+// Gradient Buffer 实例
 //================================================================================
 gradient_buffer #(
-    .NUM_TOKENS(NUM_TOKENS),
+    .NUM_LAYERS(NUM_LAYERS),
     .DIM_SMALL(DIM_SMALL),
     .DIM_LARGE(DIM_LARGE),
+    .NUM_TOKENS(NUM_TOKENS),
     .DATA_WIDTH(DATA_WIDTH),
     .TOKEN_ADDR_WIDTH(TOKEN_ADDR_WIDTH),
     .DIM_ADDR_WIDTH(DIM_ADDR_WIDTH)
 ) u_gradient_buffer (
     .clk(clk),
     .rst_n(rst_n),
+    
+    // 写入接口（来自5个GCU）
     .gcu0_wr_en(gcu0_grad_wr_en),
     .gcu0_token_addr(gcu0_grad_token),
     .gcu0_dim_addr(gcu0_grad_dim),
     .gcu0_data(gcu0_grad_data),
+    
     .gcu1_wr_en(gcu1_grad_wr_en),
     .gcu1_token_addr(gcu1_grad_token),
     .gcu1_dim_addr(gcu1_grad_dim),
     .gcu1_data(gcu1_grad_data),
+    
     .gcu2_wr_en(gcu2_grad_wr_en),
     .gcu2_token_addr(gcu2_grad_token),
     .gcu2_dim_addr(gcu2_grad_dim),
     .gcu2_data(gcu2_grad_data),
+    
     .gcu3_wr_en(gcu3_grad_wr_en),
     .gcu3_token_addr(gcu3_grad_token),
     .gcu3_dim_addr(gcu3_grad_dim),
     .gcu3_data(gcu3_grad_data),
+    
     .gcu4_wr_en(gcu4_grad_wr_en),
     .gcu4_token_addr(gcu4_grad_token),
     .gcu4_dim_addr(gcu4_grad_dim),
     .gcu4_data(gcu4_grad_data),
+    
+    // 复杂读接口（暂未使用）
     .rd_en(1'b0),
     .rd_layer_id(3'd0),
     .rd_addr(10'd0),
     .rd_data(),
     .rd_valid(),
+    
+    // 简化读接口（提供给Weight Update Engine）
     .rd_simple_en(grad_rd_req),
     .rd_simple_layer(grad_rd_layer_id),
     .rd_simple_token(grad_rd_token_id),
@@ -546,7 +576,56 @@ gradient_buffer #(
 );
 
 //================================================================================
-// 模块实例化：Weight Update Engine
+// 多层权重更新调度器
+//--------------------------------------------------------------------------------
+// 行为：
+// 1) 当 ctrl_update_start 拉高且当前没有更新任务时：
+//      - update_layer_id <= 0
+//      - update_seq_active <= 1
+//      - 产生一个周期的 wue_update_start 脉冲，启动第0层更新
+// 2) 每当当前层的 wue_update_done = 1：
+//      - 如果还没到最后一层(NUM_LAYERS-1)，层号+1，并再次产生 wue_update_start 脉冲
+//      - 如果已经是最后一层，则：
+//          * update_seq_active <= 0
+//          * 给控制器一个周期的 ctrl_update_done 脉冲
+//================================================================================
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        update_layer_id      <= 3'd0;
+        update_seq_active    <= 1'b0;
+        wue_update_start_reg <= 1'b0;
+        ctrl_update_done     <= 1'b0;
+    end else begin
+        // 默认拉低单周期脉冲
+        wue_update_start_reg <= 1'b0;
+        ctrl_update_done     <= 1'b0;
+
+        if (!update_seq_active) begin
+            // 当前没有在做多层更新，等待控制器发起一次update_start
+            if (ctrl_update_start) begin
+                update_seq_active    <= 1'b1;
+                update_layer_id      <= 3'd0;
+                wue_update_start_reg <= 1'b1;  // 启动第0层更新
+            end
+        end else begin
+            // 正在进行多层权重更新序列
+            if (wue_update_done) begin
+                if (update_layer_id == NUM_LAYERS-1) begin
+                    // 所有层更新完成
+                    update_seq_active <= 1'b0;
+                    ctrl_update_done  <= 1'b1;  // 通知上层：一次完整的UPDATE阶段完成
+                end else begin
+                    // 切换到下一层，重新启动WUE
+                    update_layer_id      <= update_layer_id + 3'd1;
+                    wue_update_start_reg <= 1'b1;
+                end
+            end
+        end
+    end
+end
+
+//================================================================================
+// Weight Update Engine 实例
 //================================================================================
 weight_update_engine #(
     .NUM_LAYERS(NUM_LAYERS),
@@ -561,10 +640,10 @@ weight_update_engine #(
 ) u_weight_update_engine (
     .clk(clk),
     .rst_n(rst_n),
-    .update_start(update_start),
-    .update_done(update_done),
+    .update_start(wue_update_start),
+    .update_done(wue_update_done),
     .update_busy(update_busy),
-    .cfg_layer_id(3'd0),  // 暂时固定，后续可扩展
+    .cfg_layer_id(update_layer_id),  // 由子系统内部多层调度器控制
     .cfg_weight_type(4'd0),
     .cfg_learning_rate(cfg_learning_rate),
     .weight_rd_req(weight_rd_req),

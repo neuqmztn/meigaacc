@@ -534,7 +534,6 @@ compute_engine #(
     
     // 数据位宽
     .EXP_WIDTH(EXP_WIDTH),            // 指数8位
-    .MANT_WIDTH(DATA_WIDTH),          // 保留参数（兼容性）
     .INPUT_MANT_WIDTH(DATA_WIDTH),    // 输入尾数16位
     
     // 向量维度
@@ -546,10 +545,9 @@ compute_engine #(
     .INTERNAL_WIDTH(CE_INTERNAL_WIDTH),     // 内部39位
     .OUTPUT_WIDTH(CE_OUTPUT_WIDTH),         // 输出32位
     .GUARD_BITS(CE_GUARD_BITS),             // 保护位7位
-    .ENABLE_ROUNDING(CE_ENABLE_ROUNDING),   // 启用舍入
+    .ENABLE_ROUNDING(CE_ENABLE_ROUNDING) // 启用舍入
     
-    // FIFO配置
-    .FIFO_DEPTH(16)                   // FIFO深度
+
 ) u_compute_engine (
     .clk(clk),
     .rst_n(rst_n),
@@ -566,8 +564,7 @@ compute_engine #(
     //--------------------------------------------------------------------------
     .exp_X(adapted_exp_buf),          // Adapted的共享指数（1个，8位）
     .mant_X_block(adapted_mant_buf),  // Adapted的尾数（8×16位）
-    
-    // ✅ 权重：32个独立共享指数 + 尾数矩阵
+ 
     .exp_W_array(weight_exp_buf),     // 32个共享指数（32×8 = 256位）
     .mant_W_blocks(weight_mant_buf),  // 权重尾数（8×32×16位）
     
@@ -578,7 +575,7 @@ compute_engine #(
     .result_ready(1'b1),              // 始终就绪（输出被缓存寄存器采样）
     
     //--------------------------------------------------------------------------
-    // ✅ 输出数据（定点格式，连接到缓存寄存器采样）
+    //  输出数据
     //--------------------------------------------------------------------------
     .result_fixed_array(ce_result_fixed_array),      // 定点累加结果（32×32位）
     .result_base_exp_array(ce_result_base_exp_array),// 基础指数（32×9位）

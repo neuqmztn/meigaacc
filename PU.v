@@ -1,282 +1,445 @@
 `timescale 1ns / 1ps
 
 //==============================================================
-// PU (Processing Unit) - Fixed v3.1
+// PU (Processing Unit) - 严谨版（4MAC / 32bit 接口 + 32bit 输出截断）
+//
+// 1) 每个 PE 内部固定包含 4 个 MAC（NUM_MAC=4），每个 MAC 计算 A*B + C*D。
+// 2) 四个打包器：
+//    - PE_A / PE_B：一个打包器负责一个 PU，输出两套 32bit 端口（pe0_* / pe1_*），可驱动 2 个同类型 PE。
+//    - PE_C / PE_D：一个打包器负责一个 PE，输出一套 32bit 端口（x_data_*_packed），只驱动 PE0。
+// 3) PU 不再做 64bit→32bit 截断，所有连到 PE 的 packed 端口统一为 32bit。
+// 4) 内部累加使用 INTERNAL_WIDTH 位（默认 39），对接输出转换器时输出 OUTPUT_WIDTH 位（默认 32），
+//    GUARD_BITS 为截断的低位数（默认 7），可选舍入或简单截断。
 //==============================================================
 
 module PU #(
-    // PE配置
-    parameter NUM_PE    = 1,           // PE数量，1或2
-    parameter PE_TYPE_0 = 0,           // PE0类型 (0=A:INT8x16, 1=B:INT16x4, 2=C:INT8x8, 3=D:INT16x2)
-    parameter PE_TYPE_1 = 2,           // PE1类型
-    
-    // 数据位宽
-    parameter EXP_WIDTH = 8,           // 指数位宽
-    parameter INPUT_MANT_WIDTH = 8,    // 输入尾数位宽
-    
-    // 向量维度分配 (注意：需与 PE_TYPE 对应)
-    parameter ELEM_PE0 = 16,           
-    parameter ELEM_PE1 = 8,              
-    parameter TOTAL_ELEM = 24,         
-    
+    parameter NUM_PE            = 1,   // 1 或 2 个 PE
+    parameter PE_TYPE_0         = 0,   // 0=A, 1=B, 2=C, 3=D
+    parameter PE_TYPE_1         = 0,   // 仅当 NUM_PE=2 时有意义，应与 PE_TYPE_0 一致或受控配置
+    parameter EXP_WIDTH         = 8,
+    parameter INPUT_MANT_WIDTH  = 8,   // A/C: 8; B/D: 16
+    parameter ELEM_PE0          = 0,   // 保留参数（由上层配置），本实现不按元素数切片
+    parameter ELEM_PE1          = 0,
+    parameter TOTAL_ELEM        = 0,   // 保留参数，应与具体模式对应 (A:16, B:4, C:8, D:2)
+
     // 输出位宽优化参数
-    parameter INTERNAL_WIDTH = 39,     // 内部累加位宽
-    parameter OUTPUT_WIDTH = 32,       // 输出位宽
-    parameter GUARD_BITS = 7,          // 截断位数
-    parameter ENABLE_ROUNDING = 1      // 1=舍入, 0=截断
+    parameter INTERNAL_WIDTH    = 39,  // 内部累加位宽（应 ≥ PE 输出位宽 + 1）
+    parameter OUTPUT_WIDTH      = 32,  // 对接转换器的输出位宽
+    parameter GUARD_BITS        = 7,   // 截断位数，通常 = INTERNAL_WIDTH - OUTPUT_WIDTH
+    parameter ENABLE_ROUNDING   = 1,   // 1=舍入, 0=截断
+
+    // PE 内部结果位宽
+    parameter PE_FINAL_WIDTH    = 38   // 单个 PE 的输出位宽
 )(
-    input  wire clk,
-    input  wire rst_n,
-    input  wire flush,
-    
-    // 输入握手
-    input  wire input_valid,
-    output wire input_ready,
-    
-    // 输出握手
-    output wire result_valid,
-    input  wire result_ready,
-    
-    // BFP格式输入
-    input  wire [EXP_WIDTH-1:0] exp_X,
-    input  wire [EXP_WIDTH-1:0] exp_W,
+    input  wire                          clk,
+    input  wire                          rst_n,
+
+    // 握手
+    input  wire                          input_valid,
+    output wire                          input_ready,
+    output wire                          result_valid,
+    input  wire                          result_ready,
+
+    input  wire                          flush,
+
+    // BFP 输入
+    input  wire [EXP_WIDTH-1:0]          exp_X,
+    input  wire [EXP_WIDTH-1:0]          exp_W,
     input  wire [TOTAL_ELEM*INPUT_MANT_WIDTH-1:0] mant_X_block,
     input  wire [TOTAL_ELEM*INPUT_MANT_WIDTH-1:0] mant_W_block,
-    
-    // 定点数输出
+
+    // 输出：定点和 + 基础指数（未归一化）
     output wire signed [OUTPUT_WIDTH-1:0] result_fixed,
-    output wire [EXP_WIDTH:0] result_base_exp,
-    output wire result_zero
+    output wire [EXP_WIDTH:0]             result_base_exp,
+    output wire                           result_zero
 );
 
-    //==============================================================
-    // 参数检查
-    //==============================================================
-    initial begin
-        if (OUTPUT_WIDTH > INTERNAL_WIDTH) begin
-            $error("ERROR: OUTPUT_WIDTH (%0d) > INTERNAL_WIDTH (%0d)", OUTPUT_WIDTH, INTERNAL_WIDTH);
-            $finish;
-        end
-    end
+//==============================================================
+// 流水线状态机：IDLE -> BUSY -> VALID
+//==============================================================
+localparam [1:0] IDLE  = 2'b00;
+localparam [1:0] BUSY  = 2'b01;
+localparam [1:0] VALID = 2'b10;
 
-    //==============================================================
-    // 状态机与流水线控制
-    //==============================================================
-    localparam IDLE  = 2'b00;
-    localparam BUSY  = 2'b01;
-    localparam VALID = 2'b10;
+reg [1:0] state, state_next;
 
-    reg [1:0] state, state_next;
-    // Latency: MAC(3) + PE(2) = 5 cycles. Pipeline depth 6 is safe.
-    localparam PIPELINE_DEPTH = 6; 
-    reg [$clog2(PIPELINE_DEPTH+1)-1:0] cycle_counter;
+// 给一个保守的流水线深度参数，供计数使用；如有需要可以调大
+localparam integer PIPELINE_DEPTH = 6;
+reg [5:0] pipe_cnt;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) state <= IDLE;
-        else if (flush) state <= IDLE;
-        else state <= state_next;
-    end
+// 接收寄存输入的寄存器
+reg [EXP_WIDTH-1:0]          exp_X_r, exp_W_r;
+reg [TOTAL_ELEM*INPUT_MANT_WIDTH-1:0] mant_X_r, mant_W_r;
 
-    always @(*) begin
-        state_next = state;
+// 输入 ready：空闲，或者结果已取走的 VALID 状态可以接新数据
+assign input_ready  = (state == IDLE) || (state == VALID && result_ready);
+// 输出 valid：仅在 VALID 状态
+assign result_valid = (state == VALID);
+
+// 用于驱动 PE 的 enable：BUSY 期间持续为 1；在接收首拍输入时也拉高一拍
+wire pipeline_enable = (state == BUSY) || (state == IDLE && input_valid && input_ready);
+
+//---------------- 状态与计数器 ----------------
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        state    <= IDLE;
+        pipe_cnt <= 6'd0;
+    end else if (flush) begin
+        state    <= IDLE;
+        pipe_cnt <= 6'd0;
+    end else begin
+        state <= state_next;
         case (state)
-            IDLE: if (input_valid && input_ready) state_next = BUSY;
-            BUSY: if (cycle_counter >= PIPELINE_DEPTH) state_next = VALID;
-            VALID: if (result_ready) state_next = IDLE;
-            default: state_next = IDLE;
+            IDLE: begin
+                if (input_valid && input_ready)
+                    pipe_cnt <= 6'd1;
+                else
+                    pipe_cnt <= 6'd0;
+            end
+            BUSY: begin
+                if (pipe_cnt != 0 && pipe_cnt < PIPELINE_DEPTH)
+                    pipe_cnt <= pipe_cnt + 6'd1;
+            end
+            VALID: begin
+                if (result_ready) begin
+                    if (input_valid)
+                        pipe_cnt <= 6'd1;    // 接新一帧
+                    else
+                        pipe_cnt <= 6'd0;
+                end
+            end
+            default: pipe_cnt <= 6'd0;
         endcase
     end
+end
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) cycle_counter <= 0;
-        else if (flush) cycle_counter <= 0;
-        else begin
-            case (state)
-                IDLE: if (input_valid && input_ready) cycle_counter <= 1; else cycle_counter <= 0;
-                BUSY: if (cycle_counter < PIPELINE_DEPTH) cycle_counter <= cycle_counter + 1;
-                VALID: if (result_ready) cycle_counter <= 0;
-                default: cycle_counter <= 0;
-            endcase
+always @(*) begin
+    state_next = state;
+    case (state)
+        IDLE: begin
+            if (input_valid && input_ready)
+                state_next = BUSY;
         end
-    end
-
-    assign input_ready = (state == IDLE);
-    assign result_valid = (state == VALID);
-    
-    // 流水线使能
-    wire pipeline_enable = (state == BUSY) || (state == IDLE && input_valid && input_ready);
-
-    //==============================================================
-    // 输入寄存
-    //==============================================================
-    localparam TOTAL_WIDTH = TOTAL_ELEM * INPUT_MANT_WIDTH;
-    reg [EXP_WIDTH-1:0] exp_X_r, exp_W_r;
-    reg [TOTAL_WIDTH-1:0] mant_X_r, mant_W_r;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            exp_X_r <= 0; exp_W_r <= 0;
-            mant_X_r <= 0; mant_W_r <= 0;
-        end else if (input_valid && input_ready) begin
-            exp_X_r <= exp_X; exp_W_r <= exp_W;
-            mant_X_r <= mant_X_block; mant_W_r <= mant_W_block;
+        BUSY: begin
+            if (pipe_cnt >= PIPELINE_DEPTH)
+                state_next = VALID;
         end
-    end
-
-    wire [EXP_WIDTH:0] group_exp;
-    assign group_exp = {1'b0, exp_X_r} + {1'b0, exp_W_r} - 9'd127;
-
-    //==============================================================
-    // PE0 处理逻辑
-    //==============================================================
-    wire [ELEM_PE0*INPUT_MANT_WIDTH-1:0] pe0_X;
-    wire [ELEM_PE0*INPUT_MANT_WIDTH-1:0] pe0_W;
-    assign pe0_X = mant_X_r[ELEM_PE0*INPUT_MANT_WIDTH-1 : 0];
-    assign pe0_W = mant_W_r[ELEM_PE0*INPUT_MANT_WIDTH-1 : 0];
-
-    wire [63:0] pe0_x_a, pe0_x_b, pe0_w_a, pe0_w_b;
-
-    generate
-        if (PE_TYPE_0 == 0) begin : pe0_packer_A
-            data_packer_PE_A u_pack (.mant_X_vec(pe0_X), .mant_W_vec(pe0_W), .x_data_a_packed(pe0_x_a), .x_data_b_packed(pe0_x_b), .w_data_a_packed(pe0_w_a), .w_data_b_packed(pe0_w_b));
-        end else if (PE_TYPE_0 == 1) begin : pe0_packer_B
-            data_packer_PE_B u_pack (.mant_X_vec(pe0_X), .mant_W_vec(pe0_W), .x_data_a_packed(pe0_x_a), .x_data_b_packed(pe0_x_b), .w_data_a_packed(pe0_w_a), .w_data_b_packed(pe0_w_b));
-        end else if (PE_TYPE_0 == 2) begin : pe0_packer_C
-            data_packer_PE_C u_pack (.mant_X_vec(pe0_X), .mant_W_vec(pe0_W), .x_data_a_packed(pe0_x_a), .x_data_b_packed(pe0_x_b), .w_data_a_packed(pe0_w_a), .w_data_b_packed(pe0_w_b));
-        end else begin : pe0_packer_D
-            data_packer_PE_D u_pack (.mant_X_vec(pe0_X), .mant_W_vec(pe0_W), .x_data_a_packed(pe0_x_a), .x_data_b_packed(pe0_x_b), .w_data_a_packed(pe0_w_a), .w_data_b_packed(pe0_w_b));
-        end
-    endgenerate
-
-    wire signed [37:0] pe0_result;
-    wire pe0_valid;
-
-    PE #(
-        // 【修复】动态 MAC 数量和位宽
-        .NUM_MAC((PE_TYPE_0 >= 2) ? 4 : 8), 
-        .ADDER_MODE((PE_TYPE_0 == 1 || PE_TYPE_0 == 3) ? 1 : 0),
-        .DATA_WIDTH(8),
-        .MAC_OUT_WIDTH(19), // 必须是 19
-        .FINAL_WIDTH(38)
-    ) u_pe0 (
-        .clk(clk), .rst_n(rst_n), .enable(pipeline_enable), .flush(flush),
-        .x_data_a_packed(pe0_x_a), .x_data_b_packed(pe0_x_b),
-        .w_data_a_packed(pe0_w_a), .w_data_b_packed(pe0_w_b),
-        .pe_result(pe0_result), .result_valid(pe0_valid)
-    );
-
-    //==============================================================
-    // PE1 处理逻辑
-    //==============================================================
-    wire signed [37:0] pe1_result;
-    wire pe1_valid;
-
-    generate
-        if (NUM_PE == 2) begin : pe1_processing
-            wire [ELEM_PE1*INPUT_MANT_WIDTH-1:0] pe1_X;
-            wire [ELEM_PE1*INPUT_MANT_WIDTH-1:0] pe1_W;
-            assign pe1_X = mant_X_r[(ELEM_PE0*INPUT_MANT_WIDTH) +: (ELEM_PE1*INPUT_MANT_WIDTH)];
-            assign pe1_W = mant_W_r[(ELEM_PE0*INPUT_MANT_WIDTH) +: (ELEM_PE1*INPUT_MANT_WIDTH)];
-
-            wire [63:0] pe1_x_a, pe1_x_b, pe1_w_a, pe1_w_b;
-            if (PE_TYPE_1 == 0) begin : pe1_packer_A
-                data_packer_PE_A u_pack (.mant_X_vec(pe1_X), .mant_W_vec(pe1_W), .x_data_a_packed(pe1_x_a), .x_data_b_packed(pe1_x_b), .w_data_a_packed(pe1_w_a), .w_data_b_packed(pe1_w_b));
-            end else if (PE_TYPE_1 == 1) begin : pe1_packer_B
-                data_packer_PE_B u_pack (.mant_X_vec(pe1_X), .mant_W_vec(pe1_W), .x_data_a_packed(pe1_x_a), .x_data_b_packed(pe1_x_b), .w_data_a_packed(pe1_w_a), .w_data_b_packed(pe1_w_b));
-            end else if (PE_TYPE_1 == 2) begin : pe1_packer_C
-                data_packer_PE_C u_pack (.mant_X_vec(pe1_X), .mant_W_vec(pe1_W), .x_data_a_packed(pe1_x_a), .x_data_b_packed(pe1_x_b), .w_data_a_packed(pe1_w_a), .w_data_b_packed(pe1_w_b));
-            end else begin : pe1_packer_D
-                data_packer_PE_D u_pack (.mant_X_vec(pe1_X), .mant_W_vec(pe1_W), .x_data_a_packed(pe1_x_a), .x_data_b_packed(pe1_x_b), .w_data_a_packed(pe1_w_a), .w_data_b_packed(pe1_w_b));
-            end
-
-            PE #(
-                .NUM_MAC((PE_TYPE_1 >= 2) ? 4 : 8), 
-                .ADDER_MODE((PE_TYPE_1 == 1 || PE_TYPE_1 == 3) ? 1 : 0),
-                .DATA_WIDTH(8),
-                .MAC_OUT_WIDTH(19),
-                .FINAL_WIDTH(38)
-            ) u_pe1 (
-                .clk(clk), .rst_n(rst_n), .enable(pipeline_enable), .flush(flush),
-                .x_data_a_packed(pe1_x_a), .x_data_b_packed(pe1_x_b),
-                .w_data_a_packed(pe1_w_a), .w_data_b_packed(pe1_w_b),
-                .pe_result(pe1_result), .result_valid(pe1_valid)
-            );
-        end else begin : pe1_zero
-            assign pe1_result = 38'sd0;
-            assign pe1_valid = 1'b0;
-        end
-    endgenerate
-
-    //==============================================================
-    // 结果累加与截断
-    //==============================================================
-    reg signed [INTERNAL_WIDTH-1:0] group_sum_internal;
-    always @(*) begin
-        if (NUM_PE == 2)
-            group_sum_internal = {{1{pe0_result[37]}}, pe0_result} + {{1{pe1_result[37]}}, pe1_result};
-        else
-            group_sum_internal = {{1{pe0_result[37]}}, pe0_result};
-    end
-
-    reg signed [OUTPUT_WIDTH-1:0] group_sum_truncated;
-    generate
-        if (OUTPUT_WIDTH == INTERNAL_WIDTH) begin : no_truncation
-            always @(*) group_sum_truncated = group_sum_internal;
-        end else begin : with_truncation
-            always @(*) begin:pu
-                reg signed [INTERNAL_WIDTH-1:0] shifted_val;
-                reg signed [OUTPUT_WIDTH-1:0] high_bits;
-                reg round_bit;
-
-                // 【修复】使用算术右移
-                shifted_val = group_sum_internal >>> GUARD_BITS;
-                high_bits = shifted_val[OUTPUT_WIDTH-1:0];
-                round_bit = group_sum_internal[GUARD_BITS-1];
-
-                if (ENABLE_ROUNDING == 1)
-                    group_sum_truncated = high_bits + {{(OUTPUT_WIDTH-1){1'b0}}, round_bit};
+        VALID: begin
+            if (result_ready) begin
+                if (input_valid)
+                    state_next = BUSY;
                 else
-                    group_sum_truncated = high_bits;
+                    state_next = IDLE;
             end
         end
-    endgenerate
+        default: state_next = IDLE;
+    endcase
+end
 
-    // 指数调整
-    reg [EXP_WIDTH:0] group_exp_adjusted;
-    generate
-        if (OUTPUT_WIDTH == INTERNAL_WIDTH)
-            always @(*) group_exp_adjusted = group_exp;
-        else
-            always @(*) group_exp_adjusted = group_exp + GUARD_BITS;
-    endgenerate
-
-    //==============================================================
-    // 输出寄存
-    //==============================================================
-    reg signed [OUTPUT_WIDTH-1:0] result_fixed_r;
-    reg [EXP_WIDTH:0] result_base_exp_r;
-    reg result_zero_r;
-
-    initial begin
-        result_fixed_r = 0; result_base_exp_r = 0; result_zero_r = 1;
+//---------------- 输入寄存 ----------------
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        exp_X_r  <= {EXP_WIDTH{1'b0}};
+        exp_W_r  <= {EXP_WIDTH{1'b0}};
+        mant_X_r <= {TOTAL_ELEM*INPUT_MANT_WIDTH{1'b0}};
+        mant_W_r <= {TOTAL_ELEM*INPUT_MANT_WIDTH{1'b0}};
+    end else if (flush) begin
+        exp_X_r  <= {EXP_WIDTH{1'b0}};
+        exp_W_r  <= {EXP_WIDTH{1'b0}};
+        mant_X_r <= {TOTAL_ELEM*INPUT_MANT_WIDTH{1'b0}};
+        mant_W_r <= {TOTAL_ELEM*INPUT_MANT_WIDTH{1'b0}};
+    end else if (input_valid && input_ready) begin
+        exp_X_r  <= exp_X;
+        exp_W_r  <= exp_W;
+        mant_X_r <= mant_X_block;
+        mant_W_r <= mant_W_block;
     end
+end
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            result_fixed_r <= 0; result_base_exp_r <= 0; result_zero_r <= 1;
-        end else if (flush) begin
-            result_fixed_r <= 0; result_base_exp_r <= 0; result_zero_r <= 1;
-        end else if (state == VALID && !result_ready) begin
-            result_fixed_r <= result_fixed_r;
-        end else if (pipeline_enable) begin
-            result_fixed_r <= group_sum_truncated;
-            result_base_exp_r <= group_exp_adjusted;
-            result_zero_r <= (group_sum_internal == 0);
+//==============================================================
+// 指数计算：PE 不参与，仅在 PU 层处理
+// group_exp = exp_X + exp_W - 127
+//==============================================================
+wire [EXP_WIDTH:0] group_exp;
+assign group_exp = {1'b0, exp_X_r} + {1'b0, exp_W_r} - 9'd127;
+
+//==============================================================
+// PE 接口信号（统一 4MAC / 32bit）
+//==============================================================
+
+wire [31:0] pe0_x_a, pe0_x_b, pe0_w_a, pe0_w_b;
+wire [31:0] pe1_x_a, pe1_x_b, pe1_w_a, pe1_w_b;
+
+wire signed [PE_FINAL_WIDTH-1:0] pe0_result;
+wire               pe0_valid;
+wire signed [PE_FINAL_WIDTH-1:0] pe1_result;
+wire               pe1_valid;
+
+//==============================================================
+// 一个打包器服务一个 PU：按 PE_TYPE_0 选择打包器 + PE 拓扑
+//==============================================================
+
+generate
+    //====================== PE_A：INT8，16 元素，双 PE ======================
+    if (PE_TYPE_0 == 0) begin : gen_type_A
+        data_packer_PE_A u_packer_A (
+            .mant_X_vec(mant_X_r),
+            .mant_W_vec(mant_W_r),
+            .pe0_x_data_a_packed(pe0_x_a),
+            .pe0_x_data_b_packed(pe0_x_b),
+            .pe0_w_data_a_packed(pe0_w_a),
+            .pe0_w_data_b_packed(pe0_w_b),
+            .pe1_x_data_a_packed(pe1_x_a),
+            .pe1_x_data_b_packed(pe1_x_b),
+            .pe1_w_data_a_packed(pe1_w_a),
+            .pe1_w_data_b_packed(pe1_w_b)
+        );
+
+        PE #(
+            .NUM_MAC      (4),
+            .ADDER_MODE   (1'b0),
+            .DATA_WIDTH   (8),
+            .MAC_OUT_WIDTH(17),
+            .FINAL_WIDTH  (PE_FINAL_WIDTH)
+        ) u_pe0 (
+            .clk             (clk),
+            .rst_n           (rst_n),
+            .enable          (pipeline_enable),
+            .flush           (flush),
+            .x_data_a_packed (pe0_x_a),
+            .x_data_b_packed (pe0_x_b),
+            .w_data_a_packed (pe0_w_a),
+            .w_data_b_packed (pe0_w_b),
+            .pe_result       (pe0_result),
+            .result_valid    (pe0_valid)
+        );
+
+        if (NUM_PE == 2) begin : has_pe1_A
+            PE #(
+                .NUM_MAC      (4),
+                .ADDER_MODE   (1'b0),
+                .DATA_WIDTH   (8),
+                .MAC_OUT_WIDTH(17),
+                .FINAL_WIDTH  (PE_FINAL_WIDTH)
+            ) u_pe1 (
+                .clk             (clk),
+                .rst_n           (rst_n),
+                .enable          (pipeline_enable),
+                .flush           (flush),
+                .x_data_a_packed (pe1_x_a),
+                .x_data_b_packed (pe1_x_b),
+                .w_data_a_packed (pe1_w_a),
+                .w_data_b_packed (pe1_w_b),
+                .pe_result       (pe1_result),
+                .result_valid    (pe1_valid)
+            );
+        end else begin : no_pe1_A
+            assign pe1_result = {PE_FINAL_WIDTH{1'b0}};
+            assign pe1_valid  = 1'b0;
         end
-    end
 
-    assign result_fixed = result_fixed_r;
-    assign result_base_exp = result_base_exp_r;
-    assign result_zero = result_zero_r;
+    //====================== PE_B：INT16，4 元素，双 PE ======================
+    end else if (PE_TYPE_0 == 1) begin : gen_type_B
+        data_packer_PE_B u_packer_B (
+            .mant_X_vec(mant_X_r),
+            .mant_W_vec(mant_W_r),
+            .pe0_x_data_a_packed(pe0_x_a),
+            .pe0_x_data_b_packed(pe0_x_b),
+            .pe0_w_data_a_packed(pe0_w_a),
+            .pe0_w_data_b_packed(pe0_w_b),
+            .pe1_x_data_a_packed(pe1_x_a),
+            .pe1_x_data_b_packed(pe1_x_b),
+            .pe1_w_data_a_packed(pe1_w_a),
+            .pe1_w_data_b_packed(pe1_w_b)
+        );
+
+        PE #(
+            .NUM_MAC      (4),
+            .ADDER_MODE   (1'b1),
+            .DATA_WIDTH   (8),
+            .MAC_OUT_WIDTH(17),
+            .FINAL_WIDTH  (PE_FINAL_WIDTH)
+        ) u_pe0 (
+            .clk             (clk),
+            .rst_n           (rst_n),
+            .enable          (pipeline_enable),
+            .flush           (flush),
+            .x_data_a_packed (pe0_x_a),
+            .x_data_b_packed (pe0_x_b),
+            .w_data_a_packed (pe0_w_a),
+            .w_data_b_packed (pe0_w_b),
+            .pe_result       (pe0_result),
+            .result_valid    (pe0_valid)
+        );
+
+        if (NUM_PE == 2) begin : has_pe1_B
+            PE #(
+                .NUM_MAC      (4),
+                .ADDER_MODE   (1'b1),
+                .DATA_WIDTH   (8),
+                .MAC_OUT_WIDTH(17),
+                .FINAL_WIDTH  (PE_FINAL_WIDTH)
+            ) u_pe1 (
+                .clk             (clk),
+                .rst_n           (rst_n),
+                .enable          (pipeline_enable),
+                .flush           (flush),
+                .x_data_a_packed (pe1_x_a),
+                .x_data_b_packed (pe1_x_b),
+                .w_data_a_packed (pe1_w_a),
+                .w_data_b_packed (pe1_w_b),
+                .pe_result       (pe1_result),
+                .result_valid    (pe1_valid)
+            );
+        end else begin : no_pe1_B
+            assign pe1_result = {PE_FINAL_WIDTH{1'b0}};
+            assign pe1_valid  = 1'b0;
+        end
+
+    //====================== PE_C：INT8，8 元素，单 PE ======================
+    end else if (PE_TYPE_0 == 2) begin : gen_type_C
+        data_packer_PE_C u_packer_C (
+            .mant_X_vec        (mant_X_r),
+            .mant_W_vec        (mant_W_r),
+            .x_data_a_packed   (pe0_x_a),
+            .x_data_b_packed   (pe0_x_b),
+            .w_data_a_packed   (pe0_w_a),
+            .w_data_b_packed   (pe0_w_b)
+        );
+
+        PE #(
+            .NUM_MAC      (4),
+            .ADDER_MODE   (1'b0),
+            .DATA_WIDTH   (8),
+            .MAC_OUT_WIDTH(17),
+            .FINAL_WIDTH  (PE_FINAL_WIDTH)
+        ) u_pe0 (
+            .clk             (clk),
+            .rst_n           (rst_n),
+            .enable          (pipeline_enable),
+            .flush           (flush),
+            .x_data_a_packed (pe0_x_a),
+            .x_data_b_packed (pe0_x_b),
+            .w_data_a_packed (pe0_w_a),
+            .w_data_b_packed (pe0_w_b),
+            .pe_result       (pe0_result),
+            .result_valid    (pe0_valid)
+        );
+
+        assign pe1_result = {PE_FINAL_WIDTH{1'b0}};
+        assign pe1_valid  = 1'b0;
+
+    //====================== PE_D：INT16，2 元素，单 PE ======================
+    end else begin : gen_type_D
+        data_packer_PE_D u_packer_D (
+            .mant_X_vec        (mant_X_r),
+            .mant_W_vec        (mant_W_r),
+            .x_data_a_packed   (pe0_x_a),
+            .x_data_b_packed   (pe0_x_b),
+            .w_data_a_packed   (pe0_w_a),
+            .w_data_b_packed   (pe0_w_b)
+        );
+
+        PE #(
+            .NUM_MAC      (4),
+            .ADDER_MODE   (1'b1),
+            .DATA_WIDTH   (8),
+            .MAC_OUT_WIDTH(17),
+            .FINAL_WIDTH  (PE_FINAL_WIDTH)
+        ) u_pe0 (
+            .clk             (clk),
+            .rst_n           (rst_n),
+            .enable          (pipeline_enable),
+            .flush           (flush),
+            .x_data_a_packed (pe0_x_a),
+            .x_data_b_packed (pe0_x_b),
+            .w_data_a_packed (pe0_w_a),
+            .w_data_b_packed (pe0_w_b),
+            .pe_result       (pe0_result),
+            .result_valid    (pe0_valid)
+        );
+
+        assign pe1_result = {PE_FINAL_WIDTH{1'b0}};
+        assign pe1_valid  = 1'b0;
+    end
+endgenerate
+
+//==============================================================
+// 定点合并（0~2 个 PE 的输出合并成 group_sum，INTERNAL_WIDTH 位）
+//==============================================================
+
+// 先把两个 PE 的 38bit 结果符号扩展到 INTERNAL_WIDTH 再相加
+wire signed [INTERNAL_WIDTH-1:0] pe0_ext;
+wire signed [INTERNAL_WIDTH-1:0] pe1_ext;
+
+assign pe0_ext = {{(INTERNAL_WIDTH-PE_FINAL_WIDTH){pe0_result[PE_FINAL_WIDTH-1]}},
+                  pe0_result};
+
+assign pe1_ext = {{(INTERNAL_WIDTH-PE_FINAL_WIDTH){pe1_result[PE_FINAL_WIDTH-1]}},
+                  pe1_result};
+
+wire signed [INTERNAL_WIDTH-1:0] group_sum;
+
+generate
+    if (NUM_PE == 2 && (PE_TYPE_0 == 0 || PE_TYPE_0 == 1)) begin : merge_two
+        assign group_sum = pe0_ext + pe1_ext;
+    end else begin : merge_single
+        assign group_sum = pe0_ext;
+    end
+endgenerate
+
+//==============================================================
+// 截断/舍入到 OUTPUT_WIDTH 位
+//==============================================================
+
+localparam integer KEPT_WIDTH = INTERNAL_WIDTH - GUARD_BITS;
+initial begin
+    // 简单一致性约束（编译期检查用，工具会 warning 但不影响综合）
+    if (KEPT_WIDTH != OUTPUT_WIDTH) begin
+        $display("WARNING: PU: INTERNAL_WIDTH - GUARD_BITS != OUTPUT_WIDTH");
+    end
+end
+
+// 0.5 ULP 的舍入偏移：在保留位最低位上加 1（即第 GUARD_BITS-1 位上加 1）
+wire signed [INTERNAL_WIDTH-1:0] rounding_bias;
+assign rounding_bias = (ENABLE_ROUNDING && (GUARD_BITS > 0)) ?
+                       {{(INTERNAL_WIDTH-GUARD_BITS){1'b0}}, 1'b1, {(GUARD_BITS-1){1'b0}}} :
+                       {INTERNAL_WIDTH{1'b0}};
+
+// 先加偏移，再截断（算术右移 GUARD_BITS）
+wire signed [INTERNAL_WIDTH-1:0] rounded_sum;
+assign rounded_sum = group_sum + rounding_bias;
+
+wire signed [OUTPUT_WIDTH-1:0] truncated_sum;
+// 保留高位 [INTERNAL_WIDTH-1 : GUARD_BITS]，宽度为 OUTPUT_WIDTH
+assign truncated_sum = rounded_sum[INTERNAL_WIDTH-1:GUARD_BITS];
+
+//==============================================================
+// 输出寄存（定点数 + 基础指数）
+//==============================================================
+
+reg signed [OUTPUT_WIDTH-1:0] result_fixed_r;
+reg [EXP_WIDTH:0]             result_base_exp_r;
+reg                           result_zero_r;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        result_fixed_r    <= {OUTPUT_WIDTH{1'b0}};
+        result_base_exp_r <= {(EXP_WIDTH+1){1'b0}};
+        result_zero_r     <= 1'b1;
+    end else if (flush) begin
+        result_fixed_r    <= {OUTPUT_WIDTH{1'b0}};
+        result_base_exp_r <= {(EXP_WIDTH+1){1'b0}};
+        result_zero_r     <= 1'b1;
+    end else if (state == VALID && result_ready) begin
+        result_fixed_r    <= truncated_sum;
+        result_base_exp_r <= group_exp;
+        result_zero_r     <= (group_sum == {INTERNAL_WIDTH{1'b0}});
+    end
+end
+
+assign result_fixed    = result_fixed_r;
+assign result_base_exp = result_base_exp_r;
+assign result_zero     = result_zero_r;
 
 endmodule

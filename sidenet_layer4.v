@@ -25,9 +25,9 @@
 
 module sidenet_layer4 #(
     // ========== Token参数 ==========
-    parameter TOKEN_NUM       = 641,
+    parameter TOKEN_NUM       = 640,
     parameter TOKEN_BATCH     = 32,
-    parameter BATCH_NUM       = 21,
+    parameter BATCH_NUM       = 20,
     
     // ========== 维度参数 ==========
     parameter BACKBONE_DIM    = 32,        // Backbone输出维度
@@ -264,11 +264,11 @@ sidenet_compression_engine #(
     .busy(compress_busy),
     
     // Backbone读接口
-    .input_rd_en(backbone_rd_en),
-    .input_rd_addr(backbone_rd_addr),
-    .input_rd_exp(backbone_rd_exp),
-    .input_rd_mant(backbone_rd_mant),
-    .input_rd_valid(backbone_rd_valid),
+    .token_rd_en(backbone_rd_en),
+    .token_rd_addr(backbone_rd_addr),
+    .token_rd_exp(backbone_rd_exp),
+    .token_rd_mant(backbone_rd_mant),
+    .token_rd_valid(backbone_rd_valid),
     
     // 权重接口
     .weight_req(compress_weight_req),
@@ -344,10 +344,10 @@ sidenet_gate_engine #(
     .adapted_rd_valid(layer3_valid),
     
     // 输出到Gated Buffer
-    .result_wr_en(gate_buf_wr_en),
-    .result_wr_addr(gate_buf_wr_addr),
-    .result_wr_exp(gate_buf_wr_exp),
-    .result_wr_mant(gate_buf_wr_mant),
+    .gated_wr_en(gate_buf_wr_en),
+    .gated_wr_addr(gate_buf_wr_addr),
+    .gated_wr_exp(gate_buf_wr_exp),
+    .gated_wr_mant(gate_buf_wr_mant),
     
     // 调试
     .dbg_state(),

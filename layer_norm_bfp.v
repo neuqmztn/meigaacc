@@ -1,22 +1,11 @@
-`timescale 1ns / 1ps
-//================================================================================
-// Layer Normalization Module with BFP Format Support
-//
-// 功能说明：
-// 1. 实现Layer Normalization: y = (x - mean) / sqrt(var + eps) * gamma + beta
-// 2. 支持BFP格式的统计量计算和归一化
-// 3. 两遍处理：第一遍计算均值和方差，第二遍归一化
-// 4. 包含平方根近似、除法近似、参数应用
-//================================================================================
-
 module layer_norm_bfp #(
-    parameter TOKEN_NUM  = 641,          // Token总数
-    parameter DIM        = 32,           // 特征维度
-    parameter DATA_WIDTH = 8,            // BFP尾数位宽
-    parameter EXP_WIDTH  = 8,            // BFP指数位宽
-    parameter ADDR_WIDTH = 10,           // 地址位宽
-    parameter ACCUM_WIDTH = 24,          // 累加器位宽
-    parameter SQRT_LUT_DEPTH = 256       // 平方根查找表深度
+    parameter TOKEN_NUM    = 641,
+    parameter DIM          = 32,
+    parameter DATA_WIDTH   = 8,
+    parameter EXP_WIDTH    = 8,
+    parameter ADDR_WIDTH   = 10,
+    parameter GUARD_BITS   = 3,      
+    parameter ACCUM_WIDTH  = 24      
 )(
     input  wire clk,
     input  wire rst_n,
@@ -25,13 +14,13 @@ module layer_norm_bfp #(
     // 控制接口
     //==========================================================================
     input  wire start,
-    input  wire mode,                     // 0=LN1, 1=LN2
+    input  wire mode,         // 0 = LN1 (使用参数组0), 1 = LN2 (使用参数组1)
     output reg  done,
     output wire busy,
     output reg  error,
     
     //==========================================================================
-    // 输入接口: 从Residual Add读取
+    // 输入/输出/参数接口 (保持不变)
     //==========================================================================
     output reg  input_rd_en,
     output reg  [ADDR_WIDTH-1:0] input_rd_addr,
@@ -39,469 +28,350 @@ module layer_norm_bfp #(
     input  wire [DIM*DATA_WIDTH-1:0] input_mant,
     input  wire input_valid,
     
-    //==========================================================================
-    // 输出接口: 写回到Input Buffer或输出
-    //==========================================================================
+    output reg  param_rd_en,
+    output reg  param_rd_gamma,
+    input  wire [EXP_WIDTH-1:0] param_exp,
+    input  wire [DIM*DATA_WIDTH-1:0] param_mant,
+    input  wire param_valid,
+    
     output reg  output_wr_en,
     output reg  [ADDR_WIDTH-1:0] output_wr_addr,
     output reg  [EXP_WIDTH-1:0] output_exp,
     output reg  [DIM*DATA_WIDTH-1:0] output_mant,
     output reg  output_valid,
-    
-    //==========================================================================
-    // 参数接口: gamma和beta (从权重存储器读取)
-    //==========================================================================
-    output reg  param_rd_en,
-    output reg  param_rd_gamma,          // 0=beta, 1=gamma
-    input  wire [EXP_WIDTH-1:0] param_exp,
-    input  wire [DIM*DATA_WIDTH-1:0] param_mant,
-    input  wire param_valid,
-    
-    //==========================================================================
-    // 调试接口
-    //==========================================================================
-    output reg  [3:0] state,
-    output reg  [9:0] processed_tokens,
-    output reg  [31:0] cycle_count,
-    output reg  overflow_flag,
-    output reg  underflow_flag
+    input  wire output_ready
 );
 
-//================================================================================
-// 状态定义
-//================================================================================
-localparam IDLE              = 4'd0;
-localparam LOAD_PARAMS       = 4'd1;  // 加载gamma和beta参数
-localparam PASS1_INIT        = 4'd2;  // 第一遍初始化
-localparam PASS1_READ        = 4'd3;  // 第一遍读取
-localparam PASS1_ACCUM       = 4'd4;  // 第一遍累加
-localparam PASS1_COMPUTE     = 4'd5;  // 计算均值和方差
-localparam PASS2_INIT        = 4'd6;  // 第二遍初始化
-localparam PASS2_READ        = 4'd7;  // 第二遍读取
-localparam PASS2_NORM        = 4'd8;  // 归一化计算
-localparam PASS2_APPLY       = 4'd9;  // 应用gamma和beta
-localparam PASS2_WRITE       = 4'd10; // 写回结果
-localparam DONE_STATE        = 4'd11;
-localparam ERROR_STATE       = 4'd12;
+    // 状态机定义
+    localparam IDLE           = 5'd0;
+    localparam LOAD_GAMMA     = 5'd1;
+    localparam LOAD_BETA      = 5'd2;
+    localparam READ_WAIT      = 5'd3;
+    localparam PREP_TOKEN     = 5'd4;
+    localparam CALC_SUM       = 5'd5;
+    localparam CALC_VAR       = 5'd6;
+    localparam ISQRT_NORM     = 5'd7;
+    localparam ISQRT_CALC     = 5'd8; 
+    localparam APPLY_GAMMA    = 5'd9;
+    localparam ADD_BETA       = 5'd10;
+    localparam FIND_MAX       = 5'd11;
+    localparam OUTPUT_NORM    = 5'd12;
+    localparam WRITE_OUT      = 5'd13;
+    localparam NEXT_TOKEN     = 5'd14;
+    localparam DONE_STATE     = 5'd15;
 
-//================================================================================
-// 内部存储
-//================================================================================
-// Token缓存（存储第一遍读取的数据）
-reg [EXP_WIDTH-1:0] token_exp_buf [0:TOKEN_NUM-1];
-reg [DIM*DATA_WIDTH-1:0] token_mant_buf [0:TOKEN_NUM-1];
-reg [TOKEN_NUM-1:0] token_valid_buf;
+    //================================================================================
+    // 内部寄存器
+    //================================================================================
+    reg [4:0] state;
+    reg [9:0] token_idx;
+    reg [3:0] wait_cnt;
+    integer i;
+    
+    // ------------------- 参数存储 (双组: [0]对应LN1, [1]对应LN2) -------------------
+    // 增加第一维度 [0:1]
+    reg [EXP_WIDTH-1:0] gamma_exp_reg [0:1];
+    reg signed [DATA_WIDTH-1:0] gamma_mant_arr [0:1][0:DIM-1]; // 2D Array
+    
+    reg [EXP_WIDTH-1:0] beta_exp_reg [0:1];
+    reg signed [DATA_WIDTH-1:0] beta_mant_arr [0:1][0:DIM-1];  // 2D Array
+    
+    reg [1:0] params_loaded; // Bit 0: LN1 loaded, Bit 1: LN2 loaded
+    reg active_mode;         // 锁存当前的 mode，防止运行中输入变化
 
-// 参数存储
-reg [EXP_WIDTH-1:0] gamma_exp;
-reg [DIM*DATA_WIDTH-1:0] gamma_mant;
-reg [EXP_WIDTH-1:0] beta_exp;
-reg [DIM*DATA_WIDTH-1:0] beta_mant;
-reg params_loaded;
+    // ------------------- 数据与计算流水线 -------------------
+    reg [EXP_WIDTH-1:0] curr_input_exp;
+    reg signed [DATA_WIDTH-1:0] curr_input_mant [0:DIM-1];
 
-// 统计量存储（每个token的均值和方差）
-reg signed [ACCUM_WIDTH-1:0] mean_accum [0:TOKEN_NUM-1];
-reg signed [ACCUM_WIDTH-1:0] var_accum [0:TOKEN_NUM-1];
-reg [EXP_WIDTH-1:0] mean_exp [0:TOKEN_NUM-1];
-reg [EXP_WIDTH-1:0] var_exp [0:TOKEN_NUM-1];
+    reg signed [ACCUM_WIDTH-1:0] sum_val;
+    reg signed [ACCUM_WIDTH+DATA_WIDTH-1:0] sum_sq_val; 
+    reg signed [DATA_WIDTH-1:0] mean_val;
+    reg signed [ACCUM_WIDTH-1:0] var_val;
 
-// 归一化中间结果
-reg [EXP_WIDTH-1:0] std_inv_exp [0:TOKEN_NUM-1];
-reg [DATA_WIDTH-1:0] std_inv_mant [0:TOKEN_NUM-1];
+    reg [4:0] var_lzc;
+    reg signed [DATA_WIDTH+2:0] inv_std_mant; 
+    reg signed [EXP_WIDTH+1:0] inv_std_exp;
 
-// 计数器和索引
-reg [9:0] token_idx;
-reg [4:0] dim_idx;
-reg [3:0] wait_cnt;
-reg [2:0] compute_cycle;
+    reg signed [31:0] term_a_mant [0:DIM-1]; 
+    reg signed [EXP_WIDTH+1:0] term_a_exp;
+    reg signed [39:0] term_final_mant [0:DIM-1]; 
+    reg signed [EXP_WIDTH+1:0] term_final_exp;
+    reg signed [39:0] max_abs_val;
 
-// 累加器
-reg signed [ACCUM_WIDTH+4:0] sum_accum;
-reg signed [ACCUM_WIDTH+8:0] sum_sq_accum;
+    //================================================================================
+    // 辅助函数: CLZ
+    //================================================================================
+    function automatic [4:0] count_leading_zeros;
+        input [23:0] val; 
+        reg [4:0] cnt;
+        reg [23:0] val_temp; 
+        begin
+            cnt = 0;
+            val_temp = val;
+            if (val_temp[23:8] == 16'b0) begin cnt = cnt + 16; val_temp = val_temp << 16; end
+            if (val_temp[23:16] == 8'b0) begin cnt = cnt + 8;  val_temp = val_temp << 8;  end
+            if (val_temp[23:20] == 4'b0) begin cnt = cnt + 4;  val_temp = val_temp << 4;  end
+            if (val_temp[23:22] == 2'b0) begin cnt = cnt + 2;  val_temp = val_temp << 2;  end
+            if (val_temp[23] == 1'b0)    cnt = cnt + 1;
+            count_leading_zeros = cnt;
+        end
+    endfunction
 
-//================================================================================
-// 临时变量声明（修复：从过程块内移到模块级别）
-//================================================================================
-// PASS1_ACCUM 状态使用的临时变量
-reg signed [DATA_WIDTH-1:0] accum_val;
-reg signed [2*DATA_WIDTH-1:0] accum_val_sq;
-
-// PASS1_COMPUTE 状态使用的临时变量
-reg signed [ACCUM_WIDTH-1:0] compute_mean_val;
-reg signed [2*ACCUM_WIDTH-1:0] compute_mean_sq;
-reg signed [ACCUM_WIDTH-1:0] compute_avg_sq;
-
-// PASS2_INIT 状态使用的临时变量
-reg [ACCUM_WIDTH-1:0] init_var_plus_eps;
-reg [7:0] init_lut_idx;
-
-// PASS2_NORM 状态使用的临时变量
-reg signed [DATA_WIDTH-1:0] norm_val [0:DIM-1];
-reg signed [DATA_WIDTH-1:0] norm_centered_val;
-reg signed [DATA_WIDTH*2-1:0] norm_scaled_val;
-
-// PASS2_APPLY 状态使用的临时变量
-reg signed [DATA_WIDTH-1:0] apply_final_val [0:DIM-1];
-reg signed [DATA_WIDTH*2-1:0] apply_gamma_scaled;
-
-//================================================================================
-// 平方根倒数查找表（简化实现）
-//================================================================================
-reg [DATA_WIDTH-1:0] sqrt_inv_lut [0:SQRT_LUT_DEPTH-1];
-
-// 初始化查找表（使用近似值）
-initial begin: init_sqrt_lut
-    integer k;
-    for (k = 0; k < SQRT_LUT_DEPTH; k = k + 1) begin
-        if (k == 0) begin
-            sqrt_inv_lut[k] = 8'hFF; // 最大值（防止除零）
+    //================================================================================
+    // 主逻辑
+    //================================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE;
+            token_idx <= 0;
+            input_rd_en <= 0;
+            output_wr_en <= 0;
+            output_valid <= 0;
+            param_rd_en <= 0;
+            done <= 0;
+            error <= 0;
+            params_loaded <= 2'b00; // 复位时两个参数组都标记为未加载
+            active_mode <= 0;
         end else begin
-            // 简化的平方根倒数近似
-            // 实际应该使用更精确的计算
-            sqrt_inv_lut[k] = 255 / $rtoi($sqrt(k));
-        end
-    end
-end
+            // 脉冲信号复位
+            input_rd_en <= 0;
+            output_wr_en <= 0;
+            output_valid <= 0;
+            param_rd_en <= 0;
 
-//================================================================================
-// 主状态机
-//================================================================================
-integer i, j;
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        state <= IDLE;
-        done <= 1'b0;
-        error <= 1'b0;
-        token_idx <= 10'd0;
-        dim_idx <= 5'd0;
-        processed_tokens <= 10'd0;
-        cycle_count <= 32'd0;
-        wait_cnt <= 4'd0;
-        compute_cycle <= 3'd0;
-        
-        input_rd_en <= 1'b0;
-        input_rd_addr <= {ADDR_WIDTH{1'b0}};
-        output_wr_en <= 1'b0;
-        output_valid <= 1'b0;
-        output_wr_addr <= {ADDR_WIDTH{1'b0}};
-        output_exp <= {EXP_WIDTH{1'b0}};
-        output_mant <= {DIM*DATA_WIDTH{1'b0}};
-        
-        param_rd_en <= 1'b0;
-        param_rd_gamma <= 1'b0;
-        params_loaded <= 1'b0;
-        
-        gamma_exp <= {EXP_WIDTH{1'b0}};
-        gamma_mant <= {DIM*DATA_WIDTH{1'b0}};
-        beta_exp <= {EXP_WIDTH{1'b0}};
-        beta_mant <= {DIM*DATA_WIDTH{1'b0}};
-        
-        token_valid_buf <= {TOKEN_NUM{1'b0}};
-        
-        sum_accum <= {(ACCUM_WIDTH+5){1'b0}};
-        sum_sq_accum <= {(ACCUM_WIDTH+9){1'b0}};
-        
-        overflow_flag <= 1'b0;
-        underflow_flag <= 1'b0;
-        
-        // 初始化临时变量
-        accum_val <= {DATA_WIDTH{1'b0}};
-        accum_val_sq <= {(2*DATA_WIDTH){1'b0}};
-        compute_mean_val <= {ACCUM_WIDTH{1'b0}};
-        compute_mean_sq <= {(2*ACCUM_WIDTH){1'b0}};
-        compute_avg_sq <= {ACCUM_WIDTH{1'b0}};
-        init_var_plus_eps <= {ACCUM_WIDTH{1'b0}};
-        init_lut_idx <= 8'd0;
-        norm_centered_val <= {DATA_WIDTH{1'b0}};
-        norm_scaled_val <= {(DATA_WIDTH*2){1'b0}};
-        apply_gamma_scaled <= {(DATA_WIDTH*2){1'b0}};
-        
-        for (j = 0; j < DIM; j = j + 1) begin
-            norm_val[j] <= {DATA_WIDTH{1'b0}};
-            apply_final_val[j] <= {DATA_WIDTH{1'b0}};
-        end
-        
-        // 清空缓存
-        for (i = 0; i < TOKEN_NUM; i = i + 1) begin
-            token_exp_buf[i] <= {EXP_WIDTH{1'b0}};
-            token_mant_buf[i] <= {DIM*DATA_WIDTH{1'b0}};
-            mean_accum[i] <= {ACCUM_WIDTH{1'b0}};
-            var_accum[i] <= {ACCUM_WIDTH{1'b0}};
-            mean_exp[i] <= {EXP_WIDTH{1'b0}};
-            var_exp[i] <= {EXP_WIDTH{1'b0}};
-            std_inv_exp[i] <= {EXP_WIDTH{1'b0}};
-            std_inv_mant[i] <= {DATA_WIDTH{1'b0}};
-        end
-        
-    end else begin
-        // 默认信号
-        input_rd_en <= 1'b0;
-        output_wr_en <= 1'b0;
-        output_valid <= 1'b0;
-        param_rd_en <= 1'b0;
-        
-        case (state)
-            //------------------------------------------------------------------
-            IDLE: begin
-                done <= 1'b0;
-                error <= 1'b0;
-                token_idx <= 10'd0;
-                processed_tokens <= 10'd0;
-                cycle_count <= 32'd0;
-                overflow_flag <= 1'b0;
-                underflow_flag <= 1'b0;
-                
-                if (start) begin
-                    if (params_loaded) begin
-                        state <= PASS1_INIT;
-                    end else begin
-                        state <= LOAD_PARAMS;
+            case (state)
+                IDLE: begin
+                    done <= 0;
+                    token_idx <= 0;
+                    if (start) begin
+                        active_mode <= mode; // 锁存当前模式
+                        // 检查当前模式对应的参数是否已加载
+                        if (params_loaded[mode]) begin
+                            state <= PREP_TOKEN;
+                        end else begin
+                            state <= LOAD_GAMMA; // 如果没加载，先去加载
+                        end
                     end
                 end
-            end
-            
-            //------------------------------------------------------------------
-            LOAD_PARAMS: begin
-                if (wait_cnt == 4'd0) begin
-                    // 请求gamma参数
-                    param_rd_en <= 1'b1;
-                    param_rd_gamma <= 1'b1;
-                    wait_cnt <= 4'd1;
-                end else if (wait_cnt == 4'd1) begin
-                    if (param_valid) begin
-                        gamma_exp <= param_exp;
-                        gamma_mant <= param_mant;
-                        wait_cnt <= 4'd2;
-                    end
-                end else if (wait_cnt == 4'd2) begin
-                    // 请求beta参数
-                    param_rd_en <= 1'b1;
-                    param_rd_gamma <= 1'b0;
-                    wait_cnt <= 4'd3;
-                end else if (wait_cnt == 4'd3) begin
-                    if (param_valid) begin
-                        beta_exp <= param_exp;
-                        beta_mant <= param_mant;
-                        params_loaded <= 1'b1;
-                        wait_cnt <= 4'd0;
-                        state <= PASS1_INIT;
-                    end
+
+                //------------------------------------------------------------
+                // 1. 加载参数 (根据 active_mode 加载到对应 Bank)
+                //------------------------------------------------------------
+                LOAD_GAMMA: begin
+                    param_rd_en <= 1; 
+                    param_rd_gamma <= 1;
+                    state <= READ_WAIT; 
+                    wait_cnt <= 0;
                 end
-            end
-            
-            //------------------------------------------------------------------
-            // 第一遍：计算均值和方差
-            //------------------------------------------------------------------
-            PASS1_INIT: begin
-                token_idx <= 10'd0;
-                token_valid_buf <= {TOKEN_NUM{1'b0}};
-                state <= PASS1_READ;
-            end
-            
-            //------------------------------------------------------------------
-            PASS1_READ: begin
-                if (wait_cnt == 4'd0) begin
-                    // 发起读请求
-                    input_rd_en <= 1'b1;
-                    input_rd_addr <= token_idx[ADDR_WIDTH-1:0];
-                    wait_cnt <= 4'd1;
-                end else begin
+                LOAD_BETA: begin
+                    param_rd_en <= 1; 
+                    param_rd_gamma <= 0;
+                    state <= READ_WAIT; 
+                    wait_cnt <= 0;
+                end
+
+                READ_WAIT: begin
                     wait_cnt <= wait_cnt + 1;
-                    if (input_valid) begin
-                        // 存储到缓存
-                        token_exp_buf[token_idx] <= input_exp;
-                        token_mant_buf[token_idx] <= input_mant;
-                        token_valid_buf[token_idx] <= 1'b1;
+                    
+                    if (param_valid) begin
+                        if (param_rd_gamma) begin
+                            // 写入对应 Bank
+                            gamma_exp_reg[active_mode] <= param_exp;
+                            for (i=0; i<DIM; i=i+1) 
+                                gamma_mant_arr[active_mode][i] <= param_mant[i*DATA_WIDTH +: DATA_WIDTH];
+                            state <= LOAD_BETA;
+                        end else begin
+                            // 写入对应 Bank
+                            beta_exp_reg[active_mode] <= param_exp;
+                            for (i=0; i<DIM; i=i+1) 
+                                beta_mant_arr[active_mode][i] <= param_mant[i*DATA_WIDTH +: DATA_WIDTH];
+                            
+                            // 标记当前 mode 参数已加载
+                            params_loaded[active_mode] <= 1'b1;
+                            state <= PREP_TOKEN;
+                        end
+                    end 
+                    else if (input_valid) begin
+                        // 输入数据返回
+                        curr_input_exp <= input_exp;
+                        for (i=0; i<DIM; i=i+1) 
+                            curr_input_mant[i] <= input_mant[i*DATA_WIDTH +: DATA_WIDTH];
+                        state <= CALC_SUM;
+                    end 
+                    else if (wait_cnt > 12) begin
+                        error <= 1; state <= DONE_STATE;
+                    end
+                end
+
+                //------------------------------------------------------------
+                // 2. 读取 Token 数据
+                //------------------------------------------------------------
+                PREP_TOKEN: begin
+                    input_rd_en <= 1;
+                    input_rd_addr <= token_idx;
+                    state <= READ_WAIT;
+                    wait_cnt <= 0;
+                end
+
+                //------------------------------------------------------------
+                // 3. 计算流水线 (Sum, Var, InvSqrt) - 与之前版本相同
+                //------------------------------------------------------------
+                CALC_SUM: begin
+                    begin : blk_sum
+                        reg signed [ACCUM_WIDTH:0] temp_sum; 
+                        reg signed [ACCUM_WIDTH+DATA_WIDTH:0] temp_sum_sq;
+                        reg signed [DATA_WIDTH:0] val_ext;
                         
-                        // 初始化累加器
-                        sum_accum <= {(ACCUM_WIDTH+5){1'b0}};
-                        sum_sq_accum <= {(ACCUM_WIDTH+9){1'b0}};
-                        dim_idx <= 5'd0;
-                        wait_cnt <= 4'd0;
-                        state <= PASS1_ACCUM;
-                    end else if (wait_cnt >= 4'd15) begin
-                        // 读取超时
-                        error <= 1'b1;
-                        state <= ERROR_STATE;
+                        temp_sum = 0;
+                        temp_sum_sq = 0;
+                        for (i=0; i<DIM; i=i+1) begin
+                            val_ext = curr_input_mant[i];
+                            temp_sum = temp_sum + val_ext;
+                            temp_sum_sq = temp_sum_sq + (val_ext * val_ext);
+                        end
+                        sum_val <= temp_sum[ACCUM_WIDTH-1:0];
+                        sum_sq_val <= temp_sum_sq[ACCUM_WIDTH+DATA_WIDTH-1:0];
                     end
+                    state <= CALC_VAR;
                 end
-            end
-            
-            //------------------------------------------------------------------
-            PASS1_ACCUM: begin
-                // 累加所有维度
-                if (dim_idx < DIM) begin
-                    // 提取当前维度的值
-                    accum_val = token_mant_buf[token_idx][dim_idx*DATA_WIDTH +: DATA_WIDTH];
-                    
-                    // 累加值和平方值
-                    sum_accum <= sum_accum + accum_val;
-                    accum_val_sq = accum_val * accum_val;
-                    sum_sq_accum <= sum_sq_accum + accum_val_sq;
-                    
-                    dim_idx <= dim_idx + 1;
-                end else begin
-                    state <= PASS1_COMPUTE;
-                    compute_cycle <= 3'd0;
+
+                CALC_VAR: begin
+                    mean_val <= sum_val >>> 5;
+                    var_val <= (sum_sq_val >>> 5) - ((sum_val >>> 5) * (sum_val >>> 5));
+                    state <= ISQRT_NORM;
                 end
-            end
-            
-            //------------------------------------------------------------------
-            PASS1_COMPUTE: begin
-                if (compute_cycle == 3'd0) begin
-                    // 计算均值：mean = sum / DIM
-                    // 使用移位近似除法（DIM=32 = 2^5）
-                    mean_accum[token_idx] <= sum_accum >>> 5;
-                    mean_exp[token_idx] <= token_exp_buf[token_idx];
-                    compute_cycle <= 3'd1;
-                    
-                end else if (compute_cycle == 3'd1) begin
-                    // 计算方差：var = sum_sq/DIM - mean^2
-                    compute_mean_val = mean_accum[token_idx];
-                    compute_mean_sq = compute_mean_val * compute_mean_val;
-                    compute_avg_sq = sum_sq_accum >>> 5; // 除以DIM
-                    
-                    // 方差 = E[X^2] - E[X]^2
-                    var_accum[token_idx] <= compute_avg_sq - compute_mean_sq[ACCUM_WIDTH-1:0];
-                    var_exp[token_idx] <= token_exp_buf[token_idx];
-                    
-                    // 处理下一个token
-                    if (token_idx < TOKEN_NUM - 1) begin
-                        token_idx <= token_idx + 1;
-                        state <= PASS1_READ;
+
+                ISQRT_NORM: begin
+                    if (var_val <= 0) begin
+                        inv_std_mant <= {1'b0, 10'h1FF}; 
+                        inv_std_exp <= 0;
                     end else begin
-                        state <= PASS2_INIT;
+                        var_lzc <= count_leading_zeros(var_val[23:0]);
                     end
+                    state <= ISQRT_CALC;
                 end
-            end
-            
-            //------------------------------------------------------------------
-            // 第二遍：应用归一化
-            //------------------------------------------------------------------
-            PASS2_INIT: begin
-                token_idx <= 10'd0;
-                processed_tokens <= 10'd0;
-                
-                // 预计算所有token的标准差倒数
-                for (i = 0; i < TOKEN_NUM && i < 64; i = i + 1) begin
-                    // 添加epsilon（小常数防止除零）
-                    init_var_plus_eps = var_accum[i] + 1;
-                    
-                    // 简化：使用高8位作为查找表索引
-                    init_lut_idx = init_var_plus_eps[ACCUM_WIDTH-1:ACCUM_WIDTH-8];
-                    
-                    // 查找平方根倒数
-                    std_inv_mant[i] <= sqrt_inv_lut[init_lut_idx];
-                    std_inv_exp[i] <= var_exp[i] >> 1; // 平方根指数减半
+
+                ISQRT_CALC: begin // 无 ROM 线性逼近
+                    if (var_val > 0) begin:q
+                        reg [4:0] shift_amt;
+                        reg [23:0] var_shifted;
+                        reg [9:0] linear_approx;
+
+                        shift_amt = (var_lzc[0]) ? (var_lzc - 1) : var_lzc;
+                        var_shifted = var_val << shift_amt;
+                        linear_approx = 10'd384 - ({1'b0, var_shifted[23:15]} >> 1);
+                        
+                        inv_std_mant <= {1'b0, linear_approx};
+                        inv_std_exp <= shift_amt >> 1;
+                    end
+                    state <= APPLY_GAMMA;
                 end
-                
-                state <= PASS2_READ;
-            end
-            
-            //------------------------------------------------------------------
-            PASS2_READ: begin
-                if (token_valid_buf[token_idx]) begin
-                    dim_idx <= 5'd0;
-                    state <= PASS2_NORM;
-                end else begin
-                    // 跳过无效token
+
+                //------------------------------------------------------------
+                // 4. 应用仿射变换 (关键修改点：根据 active_mode 选择参数)
+                //------------------------------------------------------------
+                APPLY_GAMMA: begin
+                    // 使用 active_mode 索引 gamma_exp_reg 和 gamma_mant_arr
+                    term_a_exp <= curr_input_exp + gamma_exp_reg[active_mode] + inv_std_exp;
+                    
+                    for (i=0; i<DIM; i=i+1) begin:a
+                        reg signed [DATA_WIDTH:0] diff_val;
+                        diff_val = curr_input_mant[i] - mean_val;
+                        // 选取对应的 Gamma 参数
+                        term_a_mant[i] <= diff_val * inv_std_mant * gamma_mant_arr[active_mode][i];
+                    end
+                    state <= ADD_BETA;
+                end
+
+                ADD_BETA: begin
+                    begin : align_block
+                        reg signed [EXP_WIDTH+1:0] exp_diff;
+                        reg signed [39:0] op_a, op_b;
+                        
+                        // 使用 active_mode 索引 beta_exp_reg
+                        exp_diff = $signed(term_a_exp) - $signed({2'b0, beta_exp_reg[active_mode]});
+
+                        if (exp_diff >= 0) begin
+                            term_final_exp <= term_a_exp;
+                            for (i=0; i<DIM; i=i+1) begin
+                                op_a = term_a_mant[i];
+                                // 选取对应的 Beta 参数
+                                op_b = ($signed(beta_mant_arr[active_mode][i]) <<< 8); 
+                                if (exp_diff < 30) op_b = op_b >>> exp_diff;
+                                else op_b = 0;
+                                term_final_mant[i] <= op_a + op_b;
+                            end
+                        end else begin
+                            term_final_exp <= beta_exp_reg[active_mode];
+                            for (i=0; i<DIM; i=i+1) begin
+                                // 选取对应的 Beta 参数
+                                op_b = ($signed(beta_mant_arr[active_mode][i]) <<< 8);
+                                op_a = term_a_mant[i];
+                                if ((-exp_diff) < 30) op_a = op_a >>> (-exp_diff);
+                                else op_a = 0;
+                                term_final_mant[i] <= op_a + op_b;
+                            end
+                        end
+                    end
+                    state <= FIND_MAX;
+                end
+
+                //------------------------------------------------------------
+                // 5. 输出处理
+                //------------------------------------------------------------
+                FIND_MAX: begin
+                    begin:z
+                        reg signed [39:0] local_max, abs_temp;
+                        local_max = 0;
+                        for (i=0; i<DIM; i=i+1) begin
+                            abs_temp = (term_final_mant[i] < 0) ? -term_final_mant[i] : term_final_mant[i];
+                            if (abs_temp > local_max) local_max = abs_temp;
+                        end
+                        max_abs_val <= local_max;
+                    end
+                    state <= OUTPUT_NORM;
+                end
+
+                OUTPUT_NORM: begin
+                    output_exp <= term_final_exp[EXP_WIDTH-1:0];
+                    for (i=0; i<DIM; i=i+1) begin:s
+                        reg signed [39:0] val_rnd;
+                        reg signed [7:0] val_sat;
+                        val_rnd = term_final_mant[i] + 40'd128; 
+                        val_rnd = val_rnd >>> 8;
+                        if (val_rnd > 127) val_sat = 8'd127;
+                        else if (val_rnd < -128) val_sat = -8'd128;
+                        else val_sat = val_rnd[7:0];
+                        output_mant[i*DATA_WIDTH +: DATA_WIDTH] <= val_sat;
+                    end
+                    state <= WRITE_OUT;
+                end
+
+                WRITE_OUT: begin
+                    output_wr_en <= 1; output_valid <= 1;
+                    output_wr_addr <= token_idx;
+                    if (output_ready) state <= NEXT_TOKEN;
+                end
+
+                NEXT_TOKEN: begin
                     if (token_idx < TOKEN_NUM - 1) begin
                         token_idx <= token_idx + 1;
+                        state <= PREP_TOKEN;
                     end else begin
                         state <= DONE_STATE;
                     end
                 end
-            end
-            
-            //------------------------------------------------------------------
-            PASS2_NORM: begin
-                // 对每个维度进行归一化
-                // 批量处理所有维度
-                for (i = 0; i < DIM; i = i + 1) begin
-                    // 中心化：x - mean
-                    norm_centered_val = token_mant_buf[token_idx][i*DATA_WIDTH +: DATA_WIDTH] - 
-                                   mean_accum[token_idx][DATA_WIDTH-1:0];
-                    
-                    // 缩放：(x - mean) / std
-                    norm_scaled_val = norm_centered_val * std_inv_mant[token_idx];
-                    norm_val[i] = norm_scaled_val[DATA_WIDTH*2-1:DATA_WIDTH]; // 取高位
+
+                DONE_STATE: begin
+                    done <= 1;
+                    if (!start) state <= IDLE;
                 end
                 
-                // 临时存储归一化结果
-                for (i = 0; i < DIM; i = i + 1) begin
-                    token_mant_buf[token_idx][i*DATA_WIDTH +: DATA_WIDTH] <= norm_val[i];
-                end
-                
-                state <= PASS2_APPLY;
-            end
-            
-            //------------------------------------------------------------------
-            PASS2_APPLY: begin
-                // 应用gamma和beta参数
-                for (i = 0; i < DIM; i = i + 1) begin
-                    // y = norm * gamma + beta
-                    apply_gamma_scaled = token_mant_buf[token_idx][i*DATA_WIDTH +: DATA_WIDTH] * 
-                                   gamma_mant[i*DATA_WIDTH +: DATA_WIDTH];
-                    apply_final_val[i] = apply_gamma_scaled[DATA_WIDTH*2-1:DATA_WIDTH] + 
-                                   beta_mant[i*DATA_WIDTH +: DATA_WIDTH];
-                end
-                
-                // 组装输出
-                for (i = 0; i < DIM; i = i + 1) begin
-                    output_mant[i*DATA_WIDTH +: DATA_WIDTH] <= apply_final_val[i];
-                end
-                
-                // 计算输出指数
-                output_exp <= token_exp_buf[token_idx];
-                
-                state <= PASS2_WRITE;
-            end
-            
-            //------------------------------------------------------------------
-            PASS2_WRITE: begin
-                // 写出结果
-                output_wr_en <= 1'b1;
-                output_valid <= 1'b1;
-                output_wr_addr <= token_idx[ADDR_WIDTH-1:0];
-                
-                processed_tokens <= processed_tokens + 1;
-                
-                // 处理下一个token
-                if (token_idx < TOKEN_NUM - 1) begin
-                    token_idx <= token_idx + 1;
-                    state <= PASS2_READ;
-                end else begin
-                    state <= DONE_STATE;
-                end
-            end
-            
-            //------------------------------------------------------------------
-            DONE_STATE: begin
-                done <= 1'b1;
-                if (!start) begin
-                    state <= IDLE;
-                end
-            end
-            
-            //------------------------------------------------------------------
-            ERROR_STATE: begin
-                error <= 1'b1;
-                if (!start) begin
-                    state <= IDLE;
-                end
-            end
-            
-            default: state <= IDLE;
-        endcase
-        
-        // 周期计数
-        if (state != IDLE && state != DONE_STATE && state != ERROR_STATE) begin
-            cycle_count <= cycle_count + 1;
+                default: state <= IDLE;
+            endcase
         end
     end
-end
 
-assign busy = (state != IDLE) && (state != DONE_STATE) && (state != ERROR_STATE);
+    assign busy = (state != IDLE) && (state != DONE_STATE);
 
 endmodule
