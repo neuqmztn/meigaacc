@@ -1,44 +1,17 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Sidenet Layer Output Buffer - v4.2 (统一按token读取)
-//
-// 版本历史：
-// v1.0: 基础LOB，BFP存储
-// v2.0: 新增5路GCU并行读接口  
-// v3.0: 集成BFP→Q4.12转换器
-// v4.0: 扩展支持Layer 4 (32维)
-// v4.1: 尝试统一接口（部分按维度）
-// v4.2: 完全统一！所有训练读接口都按token读取 + 向量化转换 ← 🎯 正确设计
-//
-// 主要改进（v4.2）：
-// ✅ DFA读接口改为按token读取（GCU 0-4）
-// ✅ 5个向量化转换器（GCU 0-3用8维，GCU 4用32维）
-// ✅ 分类头也按token读取（已经是了）
-// ✅ 性能提升：641次读取 vs 20,512次读取（32倍提速）
-// ✅ 接口简洁统一
-//
-// 核心思想：
-// - 推理：按token读，输出BFP
-// - 训练：按token读，输出Q4.12向量
-//
-// 作者：MEIGA Team
-// 日期：2025-11-19
-// 版本：v4.2 (推荐使用)
-//================================================================================
-
 module sidenet_layer_output_buffer #(
     //==========================================================================
     // 基本参数
     //==========================================================================
-    parameter TOKEN_NUM      = 641,         // Token数量
+    parameter TOKEN_NUM      = 640,         // Token数量
     parameter DIM_L0_L3      = 8,           // Layer 0-3维度
     parameter DIM_L4         = 32,          // Layer 4维度（Expand）
     parameter DATA_WIDTH     = 16,          // 尾数位宽 (16-bit BFP)
     parameter EXP_WIDTH      = 8,           // 指数位宽
     parameter NUM_LAYERS     = 5,           // 层数 (Layer 0-4)
     parameter ADDR_WIDTH     = 10,          // Token地址位宽
-    parameter LAYER_WIDTH    = 3            // Layer地址位宽 (0-4)
+    parameter LAYER_WIDTH    = 4           // Layer地址位宽 (0-4)
 )(
     //==========================================================================
     // 时钟和复位
@@ -133,6 +106,20 @@ module sidenet_layer_output_buffer #(
 //================================================================================
 localparam MANT_WIDTH_L0_L3 = DIM_L0_L3 * DATA_WIDTH;  // 128 bits
 localparam MANT_WIDTH_L4    = DIM_L4 * DATA_WIDTH;     // 512 bits
+localparam TOTAL_DEPTH      = TOKEN_NUM * NUM_LAYERS;
+
+// Verilog-2001 版本的 clog2
+function integer CLOG2;
+    input integer value;
+    integer i;
+begin
+    CLOG2 = 0;
+    for (i = value - 1; i > 0; i = i >> 1)
+        CLOG2 = CLOG2 + 1;
+end
+endfunction
+
+localparam TOTAL_ADDR_W = CLOG2(TOTAL_DEPTH);
 
 //================================================================================
 // 内部信号声明
@@ -147,91 +134,78 @@ reg        rd_dfa2_addr_error;
 reg        rd_dfa3_addr_error;
 reg        rd_dfa4_addr_error;
 
-reg [31:0] wr_count [0:NUM_LAYERS-1];
+// 计数器
+reg [31:0] wr_count       [0:NUM_LAYERS-1];
+reg [31:0] wr_error_count;
 reg [31:0] infer_rd_count;
 reg [31:0] dfa_rd_count;
 reg [31:0] cls_rd_count;
-reg [31:0] wr_error_count;
 reg [31:0] rd_error_count;
 
-//================================================================================
-// 存储Bank声明
-//================================================================================
-// Bank 0-3: 8维
-reg [EXP_WIDTH-1:0]      exp_bank0  [0:TOKEN_NUM-1];
-reg [MANT_WIDTH_L0_L3-1:0] mant_bank0 [0:TOKEN_NUM-1];
+// 打包 BRAM：指数 + 尾数
+(* ram_style = "block" *) reg [EXP_WIDTH-1:0]      exp_mem  [0:TOTAL_DEPTH-1];
+(* ram_style = "block" *) reg [MANT_WIDTH_L4-1:0]  mant_mem [0:TOTAL_DEPTH-1];
 
-reg [EXP_WIDTH-1:0]      exp_bank1  [0:TOKEN_NUM-1];
-reg [MANT_WIDTH_L0_L3-1:0] mant_bank1 [0:TOKEN_NUM-1];
-
-reg [EXP_WIDTH-1:0]      exp_bank2  [0:TOKEN_NUM-1];
-reg [MANT_WIDTH_L0_L3-1:0] mant_bank2 [0:TOKEN_NUM-1];
-
-reg [EXP_WIDTH-1:0]      exp_bank3  [0:TOKEN_NUM-1];
-reg [MANT_WIDTH_L0_L3-1:0] mant_bank3 [0:TOKEN_NUM-1];
-
-// Bank 4: 32维
-reg [EXP_WIDTH-1:0]      exp_bank4  [0:TOKEN_NUM-1];
-reg [MANT_WIDTH_L4-1:0]  mant_bank4 [0:TOKEN_NUM-1];
-
-//================================================================================
 // BFP→Q4.12转换器的中间信号（向量化）
-//================================================================================
+
 // GCU 0-3 (8维向量)
-reg [EXP_WIDTH-1:0]       dfa0_bfp_exp, dfa1_bfp_exp, dfa2_bfp_exp, dfa3_bfp_exp;
-reg [MANT_WIDTH_L0_L3-1:0] dfa0_bfp_mant, dfa1_bfp_mant, dfa2_bfp_mant, dfa3_bfp_mant;
-reg                       dfa0_bfp_valid, dfa1_bfp_valid, dfa2_bfp_valid, dfa3_bfp_valid;
+reg [EXP_WIDTH-1:0]           dfa0_bfp_exp, dfa1_bfp_exp, dfa2_bfp_exp, dfa3_bfp_exp;
+reg [MANT_WIDTH_L0_L3-1:0]    dfa0_bfp_mant, dfa1_bfp_mant, dfa2_bfp_mant, dfa3_bfp_mant;
+reg                           dfa0_bfp_valid, dfa1_bfp_valid, dfa2_bfp_valid, dfa3_bfp_valid;
 
 // GCU 4 (32维向量)
-reg [EXP_WIDTH-1:0]       dfa4_bfp_exp;
-reg [MANT_WIDTH_L4-1:0]   dfa4_bfp_mant;
-reg                       dfa4_bfp_valid;
+reg [EXP_WIDTH-1:0]           dfa4_bfp_exp;
+reg [MANT_WIDTH_L4-1:0]       dfa4_bfp_mant;
+reg                           dfa4_bfp_valid;
 
 // 分类头 (32维向量)
-reg [EXP_WIDTH-1:0]       cls_bfp_exp;
-reg [MANT_WIDTH_L4-1:0]   cls_bfp_mant;
-reg                       cls_bfp_valid;
+reg [EXP_WIDTH-1:0]           cls_bfp_exp;
+reg [MANT_WIDTH_L4-1:0]       cls_bfp_mant;
+reg                           cls_bfp_valid;
+
+// BRAM 读多路复用控制
+reg [2:0]                     rd_sel;      // 0:dfa0 1:dfa1 2:dfa2 3:dfa3 4:dfa4 5:infer 6:cls 7:none
+reg [2:0]                     rd_sel_d;
+reg [LAYER_WIDTH-1:0]         rd_layer;
+reg [LAYER_WIDTH-1:0]         rd_layer_d;
+reg [ADDR_WIDTH-1:0]          rd_token;
+reg                           rd_do_read;
+
+reg [TOTAL_ADDR_W-1:0]        rd_addr;
+reg [TOTAL_ADDR_W-1:0]        wr_addr;
+
+reg [EXP_WIDTH-1:0]           rd_exp_raw;
+reg [MANT_WIDTH_L4-1:0]       rd_mant_raw;
 
 //================================================================================
 // 写接口逻辑
 //================================================================================
+integer i;
+
 always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin:xie
-        integer i;
-        for (i = 0; i < TOKEN_NUM; i = i + 1) begin
-            exp_bank0[i]  <= {EXP_WIDTH{1'b0}};
-            exp_bank1[i]  <= {EXP_WIDTH{1'b0}};
-            exp_bank2[i]  <= {EXP_WIDTH{1'b0}};
-            exp_bank3[i]  <= {EXP_WIDTH{1'b0}};
-            exp_bank4[i]  <= {EXP_WIDTH{1'b0}};
-            mant_bank0[i] <= {MANT_WIDTH_L0_L3{1'b0}};
-            mant_bank1[i] <= {MANT_WIDTH_L0_L3{1'b0}};
-            mant_bank2[i] <= {MANT_WIDTH_L0_L3{1'b0}};
-            mant_bank3[i] <= {MANT_WIDTH_L0_L3{1'b0}};
-            mant_bank4[i] <= {MANT_WIDTH_L4{1'b0}};
+    if (!rst_n) begin
+        // 可选：初始化存储为0，方便仿真
+        for (i = 0; i < TOTAL_DEPTH; i = i + 1) begin
+            exp_mem[i]  <= {EXP_WIDTH{1'b0}};
+            mant_mem[i] <= {MANT_WIDTH_L4{1'b0}};
         end
-    end 
-    else if (wr_en && !wr_error) begin
+    end else if (wr_en && !wr_error) begin
+        // 写地址 = layer_id * TOKEN_NUM + token_id
+        wr_addr <= wr_layer_id * TOKEN_NUM + wr_token_id;
+
+        // 写入指数
+        exp_mem[wr_layer_id * TOKEN_NUM + wr_token_id] <= wr_exp;
+
+        // 写入尾数：L0-3 只用低 8 维，高位补 0；L4 用完整 32 维
         case (wr_layer_id)
-            3'd0: begin
-                exp_bank0[wr_token_id]  <= wr_exp;
-                mant_bank0[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
+            4'd0, 4'd1, 4'd2, 4'd3: begin
+                mant_mem[wr_layer_id * TOKEN_NUM + wr_token_id]
+                    <= {{(MANT_WIDTH_L4-MANT_WIDTH_L0_L3){1'b0}},
+                        wr_mant[MANT_WIDTH_L0_L3-1:0]};
             end
-            3'd1: begin
-                exp_bank1[wr_token_id]  <= wr_exp;
-                mant_bank1[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
-            end
-            3'd2: begin
-                exp_bank2[wr_token_id]  <= wr_exp;
-                mant_bank2[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
-            end
-            3'd3: begin
-                exp_bank3[wr_token_id]  <= wr_exp;
-                mant_bank3[wr_token_id] <= wr_mant[MANT_WIDTH_L0_L3-1:0];
-            end
-            3'd4: begin
-                exp_bank4[wr_token_id]  <= wr_exp;
-                mant_bank4[wr_token_id] <= wr_mant[MANT_WIDTH_L4-1:0];
+            default: begin // layer4
+                mant_mem[wr_layer_id * TOKEN_NUM + wr_token_id]
+                    <= wr_mant[MANT_WIDTH_L4-1:0];
             end
         endcase
     end
@@ -241,170 +215,166 @@ assign wr_ready = rst_n;
 assign wr_error = wr_addr_error || wr_layer_error;
 
 //================================================================================
-// 推理读接口（BFP格式，按token读取）
+// BRAM 读多路复用：优先级仲裁
+//================================================================================
+always @(*) begin
+    // 默认值
+    rd_sel     = 3'd7;
+    rd_layer   = {LAYER_WIDTH{1'b0}};
+    rd_token   = {ADDR_WIDTH{1'b0}};
+    rd_do_read = 1'b0;
+
+    // 简单优先级：dfa0 > dfa1 > dfa2 > dfa3 > dfa4 > infer > cls
+    if (rd_dfa0_en && !rd_dfa0_addr_error) begin
+        rd_sel     = 3'd0;
+        rd_layer   = 4'd0;
+        rd_token   = rd_dfa0_token_id;
+        rd_do_read = 1'b1;
+    end else if (rd_dfa1_en && !rd_dfa1_addr_error) begin
+        rd_sel     = 3'd1;
+        rd_layer   = 4'd1;
+        rd_token   = rd_dfa1_token_id;
+        rd_do_read = 1'b1;
+    end else if (rd_dfa2_en && !rd_dfa2_addr_error) begin
+        rd_sel     = 3'd2;
+        rd_layer   = 4'd2;
+        rd_token   = rd_dfa2_token_id;
+        rd_do_read = 1'b1;
+    end else if (rd_dfa3_en && !rd_dfa3_addr_error) begin
+        rd_sel     = 3'd3;
+        rd_layer   = 4'd3;
+        rd_token   = rd_dfa3_token_id;
+        rd_do_read = 1'b1;
+    end else if (rd_dfa4_en && !rd_dfa4_addr_error) begin
+        rd_sel     = 3'd4;
+        rd_layer   = 4'd4;
+        rd_token   = rd_dfa4_token_id;
+        rd_do_read = 1'b1;
+    end else if (rd_infer_en && !rd_infer_addr_error && !rd_infer_layer_error) begin
+        rd_sel     = 3'd5;
+        rd_layer   = rd_infer_layer_id;
+        rd_token   = rd_infer_token_id;
+        rd_do_read = 1'b1;
+    end else if (rd_cls_en) begin
+        // CLS: 固定 Layer4, Token0
+        rd_sel     = 3'd6;
+        rd_layer   = 4'd4;
+        rd_token   = {ADDR_WIDTH{1'b0}};
+        rd_do_read = 1'b1;
+    end
+end
+
+//================================================================================
+// BRAM 同步读 + 输出分发
 //================================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
+        rd_sel_d      <= 3'd7;
+        rd_layer_d    <= {LAYER_WIDTH{1'b0}};
+        rd_exp_raw    <= {EXP_WIDTH{1'b0}};
+        rd_mant_raw   <= {MANT_WIDTH_L4{1'b0}};
+
+        dfa0_bfp_exp   <= {EXP_WIDTH{1'b0}};
+        dfa1_bfp_exp   <= {EXP_WIDTH{1'b0}};
+        dfa2_bfp_exp   <= {EXP_WIDTH{1'b0}};
+        dfa3_bfp_exp   <= {EXP_WIDTH{1'b0}};
+        dfa4_bfp_exp   <= {EXP_WIDTH{1'b0}};
+        cls_bfp_exp    <= {EXP_WIDTH{1'b0}};
+
+        dfa0_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
+        dfa1_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
+        dfa2_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
+        dfa3_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
+        dfa4_bfp_mant  <= {MANT_WIDTH_L4{1'b0}};
+        cls_bfp_mant   <= {MANT_WIDTH_L4{1'b0}};
+
+        dfa0_bfp_valid <= 1'b0;
+        dfa1_bfp_valid <= 1'b0;
+        dfa2_bfp_valid <= 1'b0;
+        dfa3_bfp_valid <= 1'b0;
+        dfa4_bfp_valid <= 1'b0;
+        cls_bfp_valid  <= 1'b0;
+
         rd_infer_exp   <= {EXP_WIDTH{1'b0}};
         rd_infer_mant  <= {MANT_WIDTH_L4{1'b0}};
         rd_infer_valid <= 1'b0;
-    end 
-    else if (rd_infer_en && !rd_infer_error) begin
-        case (rd_infer_layer_id)
+    end else begin
+        rd_sel_d   <= rd_sel;
+        rd_layer_d <= rd_layer;
+
+        // 默认 valid 置 0（单拍脉冲）
+        dfa0_bfp_valid <= 1'b0;
+        dfa1_bfp_valid <= 1'b0;
+        dfa2_bfp_valid <= 1'b0;
+        dfa3_bfp_valid <= 1'b0;
+        dfa4_bfp_valid <= 1'b0;
+        cls_bfp_valid  <= 1'b0;
+        rd_infer_valid <= 1'b0;
+
+        // BRAM 同步读
+        if (rd_do_read) begin
+            rd_addr    <= rd_layer * TOKEN_NUM + rd_token;
+            rd_exp_raw <= exp_mem[rd_layer * TOKEN_NUM + rd_token];
+            rd_mant_raw<= mant_mem[rd_layer * TOKEN_NUM + rd_token];
+        end
+
+        // 上一拍的选择决定这拍的输出归属
+        case (rd_sel_d)
             3'd0: begin
-                rd_infer_exp  <= exp_bank0[rd_infer_token_id];
-                rd_infer_mant <= {{(MANT_WIDTH_L4-MANT_WIDTH_L0_L3){1'b0}}, 
-                                  mant_bank0[rd_infer_token_id]};
+                dfa0_bfp_exp   <= rd_exp_raw;
+                dfa0_bfp_mant  <= rd_mant_raw[MANT_WIDTH_L0_L3-1:0];
+                dfa0_bfp_valid <= 1'b1;
             end
             3'd1: begin
-                rd_infer_exp  <= exp_bank1[rd_infer_token_id];
-                rd_infer_mant <= {{(MANT_WIDTH_L4-MANT_WIDTH_L0_L3){1'b0}}, 
-                                  mant_bank1[rd_infer_token_id]};
+                dfa1_bfp_exp   <= rd_exp_raw;
+                dfa1_bfp_mant  <= rd_mant_raw[MANT_WIDTH_L0_L3-1:0];
+                dfa1_bfp_valid <= 1'b1;
             end
             3'd2: begin
-                rd_infer_exp  <= exp_bank2[rd_infer_token_id];
-                rd_infer_mant <= {{(MANT_WIDTH_L4-MANT_WIDTH_L0_L3){1'b0}}, 
-                                  mant_bank2[rd_infer_token_id]};
+                dfa2_bfp_exp   <= rd_exp_raw;
+                dfa2_bfp_mant  <= rd_mant_raw[MANT_WIDTH_L0_L3-1:0];
+                dfa2_bfp_valid <= 1'b1;
             end
             3'd3: begin
-                rd_infer_exp  <= exp_bank3[rd_infer_token_id];
-                rd_infer_mant <= {{(MANT_WIDTH_L4-MANT_WIDTH_L0_L3){1'b0}}, 
-                                  mant_bank3[rd_infer_token_id]};
+                dfa3_bfp_exp   <= rd_exp_raw;
+                dfa3_bfp_mant  <= rd_mant_raw[MANT_WIDTH_L0_L3-1:0];
+                dfa3_bfp_valid <= 1'b1;
             end
             3'd4: begin
-                rd_infer_exp  <= exp_bank4[rd_infer_token_id];
-                rd_infer_mant <= mant_bank4[rd_infer_token_id];
+                dfa4_bfp_exp   <= rd_exp_raw;
+                dfa4_bfp_mant  <= rd_mant_raw;
+                dfa4_bfp_valid <= 1'b1;
+            end
+            3'd5: begin
+                // 推理读接口（BFP 直出）
+                rd_infer_exp  <= rd_exp_raw;
+                // Layer0-3：只有 8 维，有效位在低 8 维
+                if (rd_layer_d == 4'd4) begin
+                    rd_infer_mant <= rd_mant_raw;
+                end else begin
+                    rd_infer_mant <= {{(MANT_WIDTH_L4-MANT_WIDTH_L0_L3){1'b0}},
+                                      rd_mant_raw[MANT_WIDTH_L0_L3-1:0]};
+                end
+                rd_infer_valid <= 1'b1;
+            end
+            3'd6: begin
+                // CLS：Layer4, Token0
+                cls_bfp_exp   <= rd_exp_raw;
+                cls_bfp_mant  <= rd_mant_raw;
+                cls_bfp_valid <= 1'b1;
+            end
+            default: begin
+                // no-op
             end
         endcase
-        rd_infer_valid <= 1'b1;
-    end 
-    else begin
-        rd_infer_valid <= 1'b0;
-    end
-end
-
-assign rd_infer_error = rd_infer_addr_error || rd_infer_layer_error;
-
-//================================================================================
-// DFA训练读接口 - GCU 0 (按token读取，8维向量)
-//================================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dfa0_bfp_exp   <= {EXP_WIDTH{1'b0}};
-        dfa0_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
-        dfa0_bfp_valid <= 1'b0;
-    end 
-    else if (rd_dfa0_en && !rd_dfa0_addr_error) begin
-        dfa0_bfp_exp   <= exp_bank0[rd_dfa0_token_id];
-        dfa0_bfp_mant  <= mant_bank0[rd_dfa0_token_id];  // 完整8维
-        dfa0_bfp_valid <= 1'b1;
-    end 
-    else begin
-        dfa0_bfp_valid <= 1'b0;
     end
 end
 
 //================================================================================
-// DFA训练读接口 - GCU 1 (按token读取，8维向量)
-//================================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dfa1_bfp_exp   <= {EXP_WIDTH{1'b0}};
-        dfa1_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
-        dfa1_bfp_valid <= 1'b0;
-    end 
-    else if (rd_dfa1_en && !rd_dfa1_addr_error) begin
-        dfa1_bfp_exp   <= exp_bank1[rd_dfa1_token_id];
-        dfa1_bfp_mant  <= mant_bank1[rd_dfa1_token_id];  // 完整8维
-        dfa1_bfp_valid <= 1'b1;
-    end 
-    else begin
-        dfa1_bfp_valid <= 1'b0;
-    end
-end
-
-//================================================================================
-// DFA训练读接口 - GCU 2 (按token读取，8维向量)
-//================================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dfa2_bfp_exp   <= {EXP_WIDTH{1'b0}};
-        dfa2_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
-        dfa2_bfp_valid <= 1'b0;
-    end 
-    else if (rd_dfa2_en && !rd_dfa2_addr_error) begin
-        dfa2_bfp_exp   <= exp_bank2[rd_dfa2_token_id];
-        dfa2_bfp_mant  <= mant_bank2[rd_dfa2_token_id];  // 完整8维
-        dfa2_bfp_valid <= 1'b1;
-    end 
-    else begin
-        dfa2_bfp_valid <= 1'b0;
-    end
-end
-
-//================================================================================
-// DFA训练读接口 - GCU 3 (按token读取，8维向量)
-//================================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dfa3_bfp_exp   <= {EXP_WIDTH{1'b0}};
-        dfa3_bfp_mant  <= {MANT_WIDTH_L0_L3{1'b0}};
-        dfa3_bfp_valid <= 1'b0;
-    end 
-    else if (rd_dfa3_en && !rd_dfa3_addr_error) begin
-        dfa3_bfp_exp   <= exp_bank3[rd_dfa3_token_id];
-        dfa3_bfp_mant  <= mant_bank3[rd_dfa3_token_id];  // 完整8维
-        dfa3_bfp_valid <= 1'b1;
-    end 
-    else begin
-        dfa3_bfp_valid <= 1'b0;
-    end
-end
-
-//================================================================================
-// DFA训练读接口 - GCU 4 (按token读取，32维向量)
-//================================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dfa4_bfp_exp   <= {EXP_WIDTH{1'b0}};
-        dfa4_bfp_mant  <= {MANT_WIDTH_L4{1'b0}};
-        dfa4_bfp_valid <= 1'b0;
-    end 
-    else if (rd_dfa4_en && !rd_dfa4_addr_error) begin
-        dfa4_bfp_exp   <= exp_bank4[rd_dfa4_token_id];
-        dfa4_bfp_mant  <= mant_bank4[rd_dfa4_token_id];  // 完整32维
-        dfa4_bfp_valid <= 1'b1;
-    end 
-    else begin
-        dfa4_bfp_valid <= 1'b0;
-    end
-end
-
-//================================================================================
-// 分类头读接口 (固定读取Token 0，32维向量)
-//================================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        cls_bfp_exp   <= {EXP_WIDTH{1'b0}};
-        cls_bfp_mant  <= {MANT_WIDTH_L4{1'b0}};
-        cls_bfp_valid <= 1'b0;
-    end 
-    else if (rd_cls_en) begin
-        // 固定读取Token 0 (CLS token)
-        cls_bfp_exp   <= exp_bank4[10'd0];
-        cls_bfp_mant  <= mant_bank4[10'd0];  // 完整32维
-        cls_bfp_valid <= 1'b1;
-    end 
-    else begin
-        cls_bfp_valid <= 1'b0;
-    end
-end
-
-//================================================================================
-// BFP→Q4.12向量化转换器实例化
+// BFP→Q4.12 向量转换器实例
 //================================================================================
 
-// GCU 0-3: 8维向量转换器
+// GCU 0-3: 8维向量
 bfp_to_q412_vector_converter #(
     .DIM            (DIM_L0_L3),
     .BFP_MANT_WIDTH (DATA_WIDTH),
@@ -535,12 +505,13 @@ always @(*) begin
     rd_dfa4_addr_error = (rd_dfa4_token_id >= TOKEN_NUM);
 end
 
+assign rd_infer_error = rd_infer_addr_error || rd_infer_layer_error;
+
 //================================================================================
 // 计数器（调试用）
 //================================================================================
 always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin:ji
-        integer i;
+    if (!rst_n) begin
         for (i = 0; i < NUM_LAYERS; i = i + 1) begin
             wr_count[i] <= 32'd0;
         end
@@ -580,14 +551,14 @@ end
 //================================================================================
 // 调试接口连接
 //================================================================================
-assign dbg_wr_count_l0 = wr_count[0];
-assign dbg_wr_count_l1 = wr_count[1];
-assign dbg_wr_count_l2 = wr_count[2];
-assign dbg_wr_count_l3 = wr_count[3];
-assign dbg_wr_count_l4 = wr_count[4];
+assign dbg_wr_count_l0    = wr_count[0];
+assign dbg_wr_count_l1    = wr_count[1];
+assign dbg_wr_count_l2    = wr_count[2];
+assign dbg_wr_count_l3    = wr_count[3];
+assign dbg_wr_count_l4    = wr_count[4];
 assign dbg_infer_rd_count = infer_rd_count;
-assign dbg_dfa_rd_count = dfa_rd_count;
-assign dbg_cls_rd_count = cls_rd_count;
+assign dbg_dfa_rd_count   = dfa_rd_count;
+assign dbg_cls_rd_count   = cls_rd_count;
 assign dbg_wr_error_count = wr_error_count;
 assign dbg_rd_error_count = rd_error_count;
 

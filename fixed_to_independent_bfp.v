@@ -1,34 +1,5 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Fixed-Point to Independent BFP Normalizer
-// 
-// 功能：将CE输出的定点数转换为独立BFP格式（每个结果有独立指数）
-// 
-// 特点：
-// - 只做归一化，不做共享指数对齐
-// - 保持最高精度（无对齐截断）
-// - 每个结果有独立指数
-// - 支持8位或16位尾数配置
-// - 适合训练场景（高精度）
-// 
-// 输入：定点数 + 基础指数（CE输出）
-// 输出：归一化尾数 + 独立指数（Independent BFP）
-//
-// 数据流：
-//   定点数(未归一化) → 归一化 → 独立BFP
-//   无共享指数，无对齐，无精度损失
-//
-// 版本：v1.1 - Verilog-2001兼容性修复
-// 标准：Verilog-2001
-// 修改日期：2025-11-14
-//
-// 主要修改：
-// 1. 删除automatic关键字
-// 2. 使用generate展开数组打包操作
-// 3. 简化组合逻辑，提高可综合性
-//================================================================================
-
 module fixed_to_independent_bfp #(
     parameter TOTAL_RESULTS = 12,          // 结果数量（通常12个PU输出）
     parameter FIXED_WIDTH = 32,            // 定点输入位宽（32或39）
@@ -180,34 +151,7 @@ module fixed_to_independent_bfp #(
         end
     end
 
-    //==========================================================================
-    // 调试信息
-    //==========================================================================
-    initial begin
-        $display("========================================");
-        $display("Fixed to Independent BFP Normalizer v1.1");
-        $display("========================================");
-        $display("Configuration:");
-        $display("  Total Results:     %0d", TOTAL_RESULTS);
-        $display("  Fixed Width:       %0d-bit", FIXED_WIDTH);
-        $display("  Output Mant Width: %0d-bit", OUTPUT_MANT_WIDTH);
-        $display("  Output Exp Width:  %0d-bit", OUTPUT_EXP_WIDTH);
-        $display("========================================");
-        $display("Features:");
-        $display("  ✓ Verilog-2001 compliant");
-        $display("  ✓ Independent BFP (No shared exponent)");
-        $display("  ✓ Maximum precision (No alignment loss)");
-        $display("  ✓ Suitable for training");
-        $display("  ✓ Configurable mantissa: 8-bit or 16-bit");
-        $display("========================================");
-        $display("Output Format:");
-        $display("  Each result: %0d-bit mant + %0d-bit exp", OUTPUT_MANT_WIDTH, OUTPUT_EXP_WIDTH);
-        $display("  Total output: %0d results", TOTAL_RESULTS);
-        $display("  Storage: %0d bits (mant) + %0d bits (exp)",
-                 TOTAL_RESULTS*OUTPUT_MANT_WIDTH,
-                 TOTAL_RESULTS*OUTPUT_EXP_WIDTH);
-        $display("========================================");
-    end
+
 
 endmodule
 

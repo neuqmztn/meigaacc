@@ -1,50 +1,5 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// MEIGA Top Module - 系统顶层集成 (Updated Version)
-//
-// 更新日期: 2025-11-16
-// 版本: v2.0
-//
-// 主要更新:
-// 1. ✅ 新增 FFN权重接口（Backbone和SideNet）
-// 2. ❌ 删除 LN1暂存接口（现在使用内部buffer）
-// 3. ⚠️  更新 LayerNorm接口为ln_param_valid
-// 4. ✅ 所有权重改为数组格式（每列独立指数）
-//
-// 功能：
-// 集成Backbone Transformer和SideNet，实现完整的MEIGA架构
-// - 4层Backbone Transformer（分时复用单个模块）
-// - 5层SideNet（Layer 0专用，Layer 1-3复用，Layer 4专用）
-// - 层间Token Buffer（双Bank乒乓切换）
-// - SideNet输出Buffer（4-Bank独立存储）
-// - 权重管理（Backbone和SideNet独立）
-//
-// 架构：
-// 1. meiga_control: 顶层FSM控制器
-// 2. backbone_transformer: 单层Transformer，复用4次
-// 3. layer_token_buffer_dual_bank: 层间存储（42KB双Bank）
-// 4. sidenet_layer0: Layer 0专用（仅Compression）
-// 5. sidenet_layer_standard: Layer 1-3复用
-// 6. sidenet_layer4: Layer 4专用（含Expand）
-// 7. sidenet_layer_output_buffer: SideNet输出4-Bank存储
-// 8. weight_controller: Backbone权重管理
-// 9. sidenet_weight_storage: SideNet权重存储
-// 10. sidenet_weight_controller: SideNet权重控制
-//
-// 数据流：
-// Input → Layer Token Buffer BANK A
-// Layer i: Backbone读BANK A/B → 写BANK B/A
-//          Sidenet读BANK A/B → 写Layer Output Buffer
-// Bank Swap after each layer
-// Layer 4: Sidenet Only → Final Output
-//
-// Author: MEIGA Design Team
-// Date: 2025-11-16
-// Version: 2.0
-// Standard: Verilog 2001
-//================================================================================
-
 module meiga_top #(
     // ========== 网络参数 ==========
     parameter NUM_LAYERS       = 4,         // Backbone层数
@@ -515,7 +470,6 @@ meiga_control #(
 
 //------------------------------------------------------------------------
 // 2. Backbone Transformer（复用4层）
-// ✅ 更新：新增FFN权重接口，删除LN1暂存接口
 //------------------------------------------------------------------------
 backbone_transformer #(
     .TOKEN_NUM(TOKEN_NUM),
@@ -862,10 +816,11 @@ sidenet_layer4 #(
 //------------------------------------------------------------------------
 sidenet_layer_output_buffer #(
     .TOKEN_NUM(TOKEN_NUM),
-    .DIM(SIDENET_DIM),
+    .DIM_L0_L3(8),
+    .DIM_L4(32),
     .DATA_WIDTH(DATA_WIDTH_SN),
     .EXP_WIDTH(EXP_WIDTH),
-    .NUM_LAYERS(4),
+    .NUM_LAYERS(5),
     .ADDR_WIDTH(ADDR_WIDTH),
     .LAYER_WIDTH(2)
 ) u_sidenet_layer_output_buffer (
@@ -919,8 +874,8 @@ weight_controller #(
     .DIM(BACKBONE_DIM),
     .DATA_WIDTH(DATA_WIDTH_BB),
     .EXP_WIDTH(EXP_WIDTH),
-    .DRAM_ADDR_WIDTH(DRAM_ADDR_WIDTH),
-    .DRAM_DATA_WIDTH(DRAM_DATA_WIDTH),
+    .DRAM_ADDR_WIDTH(32),
+    .DRAM_DATA_WIDTH(256),
     .CACHE_ENTRIES(4)
 ) u_weight_controller (
     .clk(clk),

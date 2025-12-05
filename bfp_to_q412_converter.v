@@ -1,51 +1,11 @@
 `timescale 1ns / 1ps
 
 //================================================================================
-// BFP to Q4.12 Converter
-//
-// 功能说明：
-// 将16-bit BFP (Block Floating Point) 格式转换为Q4.12定点格式
-//
-// BFP格式：
-// • mantissa: 16-bit 有符号整数
-// • exponent: 8-bit 有符号整数 (实际范围约-128到127)
-// • 值 = mantissa × 2^exponent
-//
-// Q4.12格式：
-// • 16-bit 有符号定点数
-// • 4位整数部分 + 12位小数部分
-// • 范围: [-8.0, 7.9998]
-// • 精度: 1/4096 ≈ 0.000244
-//
-// 转换公式：
-// value_bfp = mantissa × 2^exponent
-// value_q412 = value_bfp × 4096
-//            = mantissa × 2^(exponent + 12)
-//
-// 实现逻辑：
-// shift_amount = exponent + 12
-// if (shift_amount >= 0):
-//     result = mantissa << shift_amount  (左移)
-// else:
-//     result = mantissa >>> (-shift_amount)  (算术右移)
-//
-// 饱和处理：
-// if (result > 32767):  result = 32767
-// if (result < -32768): result = -32768
-//
-// 流水线设计（3级）：
-// Stage 1: 计算移位量、方向，处理零值
-// Stage 2: 执行桶形移位器
-// Stage 3: 溢出检测、饱和处理、输出
-//
-// 特殊情况处理：
-// • mantissa = 0 → 直接输出0
-// • 移位量过大 (>31) → 饱和或截断
-// • 负数右移 → 使用算术右移保持符号
-//
-// 作者：MEIGA Team
-// 日期：2025-11-18
-// 版本：v1.0
+// BFP to Q4.12 Converter (Fixed Version)
+// 
+// 修复记录：
+// 1. [FIX] Stage 1: 修正了 bfp_exp 的符号扩展逻辑，正确处理负指数。
+// 2. [FIX] Stage 3: 修正了饱和判断中的符号扩展，防止将负的最大值误判为正数。
 //================================================================================
 
 module bfp_to_q412_converter #(
@@ -54,44 +14,29 @@ module bfp_to_q412_converter #(
     parameter Q412_WIDTH     = 16,      // Q4.12位宽
     parameter Q412_FRAC_BITS = 12       // Q4.12小数位数
 )(
-    //==========================================================================
-    // 时钟和复位
-    //==========================================================================
     input  wire clk,
     input  wire rst_n,
     
-    //==========================================================================
     // 控制接口
-    //==========================================================================
-    input  wire        valid_in,        // 输入有效
-    output reg         valid_out,       // 输出有效
+    input  wire         valid_in,
+    output reg          valid_out,
     
-    //==========================================================================
     // BFP输入
-    //==========================================================================
-    input  wire signed [BFP_MANT_WIDTH-1:0] bfp_mant,   // BFP尾数（有符号）
-    input  wire signed [BFP_EXP_WIDTH-1:0]  bfp_exp,    // BFP指数（有符号）
+    input  wire signed [BFP_MANT_WIDTH-1:0] bfp_mant,
+    input  wire signed [BFP_EXP_WIDTH-1:0]  bfp_exp,
     
-    //==========================================================================
     // Q4.12输出
-    //==========================================================================
-    output reg  signed [Q412_WIDTH-1:0] q412_data,      // Q4.12数据（有符号）
+    output reg  signed [Q412_WIDTH-1:0] q412_data,
     
-    //==========================================================================
     // 状态和调试
-    //==========================================================================
-    output reg         overflow,        // 溢出标志
-    output reg         underflow,       // 下溢标志
-    output wire [2:0]  pipeline_stage   // 流水线阶段指示
+    output reg          overflow,
+    output reg          underflow,
+    output wire [2:0]   pipeline_stage
 );
 
 //================================================================================
 // 内部参数
 //================================================================================
-localparam MAX_SHIFT_LEFT  = 31;    // 最大左移位数
-localparam MAX_SHIFT_RIGHT = 31;    // 最大右移位数
-
-// Q4.12的范围限制
 localparam signed [Q412_WIDTH-1:0] Q412_MAX =  16'sd32767;  // +7.9998
 localparam signed [Q412_WIDTH-1:0] Q412_MIN = -16'sd32768;  // -8.0
 
@@ -99,7 +44,7 @@ localparam signed [Q412_WIDTH-1:0] Q412_MIN = -16'sd32768;  // -8.0
 // Stage 1: 移位量计算和特殊情况检测
 //================================================================================
 
-// Stage 1 寄存器
+// Stage 1 寄存器声明 (必须在 always 块之前!)
 reg signed [BFP_MANT_WIDTH-1:0] s1_mant;
 reg signed [8:0]                s1_shift_amount;  // 9位以处理溢出
 reg                             s1_shift_left;    // 1=左移, 0=右移
@@ -122,11 +67,12 @@ always @(posedge clk or negedge rst_n) begin
             // 检测零值
             s1_is_zero <= (bfp_mant == 0);
             
-            // 计算实际移位量 = exponent + 12
-            s1_shift_amount <= $signed({1'b0, bfp_exp}) + 9'sd12;
+            // [FIX 1] 修复：正确的符号扩展
+            // bfp_exp 是 signed，Verilog 会自动进行符号扩展以匹配 9位的加法
+            s1_shift_amount <= bfp_exp + 9'sd12;
             
             // 确定移位方向
-            if ($signed({1'b0, bfp_exp}) + 9'sd12 >= 0) begin
+            if (bfp_exp + 9'sd12 >= 9'sd0) begin
                 s1_shift_left <= 1'b1;
             end else begin
                 s1_shift_left <= 1'b0;
@@ -139,28 +85,30 @@ end
 // Stage 2: 桶形移位器
 //================================================================================
 
-// Stage 2 寄存器
-reg signed [47:0]  s2_shifted;      // 扩展到48位防止溢出
-reg                s2_is_zero;
-reg                s2_valid;
+// Stage 2 寄存器声明
+reg signed [47:0] s2_shifted;       // 扩展到48位防止溢出
+reg               s2_is_zero;
+reg               s2_valid;
 
 // 移位逻辑（组合逻辑）
-reg signed [47:0]  shifted_result;
-reg [5:0]          abs_shift_amount;
+reg signed [47:0] shifted_result;
+reg [5:0]         abs_shift_amount;
 
 always @(*) begin
     // 提取移位量的绝对值（限制在0-31）
     if (s1_shift_left) begin
-        if (s1_shift_amount[8:5] != 4'b0) begin
+        if (s1_shift_amount > 9'sd31) begin
             // 移位量 >= 32，钳位到31
             abs_shift_amount = 6'd31;
         end else begin
             abs_shift_amount = s1_shift_amount[5:0];
         end
     end else begin
+        // 处理负数移位量 (右移)
         if ((-s1_shift_amount) >= 32) begin
             abs_shift_amount = 6'd31;
         end else begin
+            // 取反加一获得绝对值
             abs_shift_amount = (-s1_shift_amount[5:0]) & 6'h3F;
         end
     end
@@ -195,8 +143,8 @@ end
 //================================================================================
 
 // 溢出检测逻辑（组合逻辑）
-reg        detect_overflow;
-reg        detect_underflow;
+reg                     detect_overflow;
+reg                     detect_underflow;
 reg signed [Q412_WIDTH-1:0] saturated_result;
 
 always @(*) begin
@@ -207,16 +155,20 @@ always @(*) begin
         // 零值直接输出
         saturated_result = 16'sd0;
     end else begin
-        // 检查是否溢出（检查高位是否全为符号扩展）
-        if (s2_shifted > $signed({32'sd0, Q412_MAX})) begin
-            // 正溢出
+        // [FIX 2] 修复：正确的符号扩展比较
+        // 必须将 Q412_MAX/MIN 的符号位扩展到 48 位，否则 Verilog 会将其视为无符号数比较
+        
+        // 检查正溢出 (Q412_MAX = 0x7FFF)
+        if (s2_shifted > $signed({{32{Q412_MAX[15]}}, Q412_MAX})) begin
             saturated_result = Q412_MAX;
             detect_overflow = 1'b1;
-        end else if (s2_shifted < $signed({32'sd0, Q412_MIN})) begin
-            // 负溢出
+        end 
+        // 检查负溢出 (Q412_MIN = 0x8000)
+        else if (s2_shifted < $signed({{32{Q412_MIN[15]}}, Q412_MIN})) begin
             saturated_result = Q412_MIN;
             detect_underflow = 1'b1;
-        end else begin
+        end 
+        else begin
             // 正常范围，直接截取低16位
             saturated_result = s2_shifted[Q412_WIDTH-1:0];
         end
@@ -275,19 +227,19 @@ always @(posedge clk) begin
         
         if (overflow) begin
             overflow_count = overflow_count + 1;
-            $display("[%0t] BFP→Q4.12 Overflow: mant=%0d, exp=%0d → saturated to %0d", 
-                     $time, s2_shifted, q412_data);
+            $display("[%0t] BFP->Q4.12 Overflow: raw_shifted=%h (dec %0d) -> saturated to %0d", 
+                     $time, s2_shifted, s2_shifted, q412_data);
         end
         
         if (underflow) begin
             underflow_count = underflow_count + 1;
-            $display("[%0t] BFP→Q4.12 Underflow: result saturated to %0d", 
-                     $time, q412_data);
+            $display("[%0t] BFP->Q4.12 Underflow: raw_shifted=%h (dec %0d) -> saturated to %0d", 
+                     $time, s2_shifted, s2_shifted, q412_data);
         end
         
         // 每1000次转换显示统计
         if (conversion_count % 1000 == 0) begin
-            $display("[%0t] BFP→Q4.12 Stats: Total=%0d, Overflow=%0d, Underflow=%0d",
+            $display("[%0t] Stats: Total=%0d, Ovf=%0d, Und=%0d",
                      $time, conversion_count, overflow_count, underflow_count);
         end
     end

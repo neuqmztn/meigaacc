@@ -1,203 +1,313 @@
 `timescale 1ns / 1ps
 
-//==============================================================
-// GELU激活引擎 - 优化版本
-//==============================================================
-
+//================================================================================
+// GELU Engine v4.2 (Scheme B - PWL Logic Version) - Verilog-2001
+//
+// 功能概述：
+// 1. 高精度输入 -> PWL 拟合 (无 LUT RAM) -> 压缩输出 (16-bit -> 8-bit)
+// 2. 32 个独立指数直接透传
+//
+// 拟合区间 [-4.0, 4.0]，在此区间外：
+//   x >  4.0 -> y = x
+//   x < -4.0 -> y = 0
+//
+// 结构改写：
+// - 拆分为多段 always 块：FSM/valid 控制 + 3 级流水寄存器
+// - 所有寄存器只有唯一的 reset 赋值，避免 "both Set and Reset" 的综合告警
+//================================================================================
 module gelu_engine #(
-    parameter MATRIX_SIZE = 32,
-    parameter FEATURE_SIZE = 32,
-    parameter BFP_EXP_W = 8,
-    parameter ACC_MANT_W = 15,
-    parameter LUT_DEPTH = 512,
+    parameter TOKEN_CHUNK     = 32,
+    parameter MATRIX_SIZE     = 32,
+    parameter FEATURE_SIZE    = 32,
+
+    parameter BFP_EXP_W       = 8,
+    parameter INPUT_MANT_W    = 16,      // Q3.12 格式
+    parameter OUTPUT_MANT_W   = 8,       // 输出压缩位宽
     parameter PIPELINE_STAGES = 4
 )(
     input  wire clk,
     input  wire rst_n,
-    
     input  wire start,
     output reg  done,
-    
-    // 输入矩阵 [32x32]
-    input  wire [BFP_EXP_W-1:0] h_in_exp,
-    input  wire [MATRIX_SIZE*FEATURE_SIZE*ACC_MANT_W-1:0] h_in_mant,
-    
-    // 输出矩阵 [32x32]
-    output reg  [BFP_EXP_W-1:0] h_out_exp,
-    output reg  [MATRIX_SIZE*FEATURE_SIZE*ACC_MANT_W-1:0] h_out_mant
+    output reg  busy,
+
+    input  wire [TOKEN_CHUNK*BFP_EXP_W-1:0]               in_exp,
+    input  wire [MATRIX_SIZE*FEATURE_SIZE*INPUT_MANT_W-1:0] in_mant,
+
+    output reg  [TOKEN_CHUNK*BFP_EXP_W-1:0]                 out_exp,
+    output reg  [MATRIX_SIZE*FEATURE_SIZE*OUTPUT_MANT_W-1:0] out_mant
 );
 
-//==============================================================
-// GELU查找表
-//==============================================================
+    // =========================================================================
+    // 常量与状态
+    // =========================================================================
+    localparam [INPUT_MANT_W-1:0] FIXED_ONE = 16'h1000;   // 1.0 (Q3.12)
 
-// 双精度LUT：正负分开
-reg [ACC_MANT_W-1:0] gelu_lut_pos [0:LUT_DEPTH/2-1];
-reg [ACC_MANT_W-1:0] gelu_lut_neg [0:LUT_DEPTH/2-1];
+    // FSM
+    localparam IDLE       = 3'd0;
+    localparam PROCESS    = 3'd1;
+    localparam DONE_STATE = 3'd2;
 
-// LUT初始化
-initial begin:gelu
-    integer i;
-    real x, gelu_val;
-    
-    for (i = 0; i < LUT_DEPTH/2; i = i + 1) begin
-        // 正数部分 [0, 8]
-        x = i * 8.0 / (LUT_DEPTH/2);
-        gelu_val = x * 0.5 * (1.0 + tanh(sqrt(2.0/3.14159) * (x + 0.044715 * x * x * x)));
-        gelu_lut_pos[i] = $rtoi(gelu_val * (1 << (ACC_MANT_W-3)));
-        
-        // 负数部分 [-8, 0]
-        x = -i * 8.0 / (LUT_DEPTH/2);
-        gelu_val = x * 0.5 * (1.0 + tanh(sqrt(2.0/3.14159) * (x + 0.044715 * x * x * x)));
-        gelu_lut_neg[i] = $rtoi(gelu_val * (1 << (ACC_MANT_W-3)));
-    end
-end
+    reg [2:0] state;
 
-//==============================================================
-// 流水线处理
-//==============================================================
+    // 流水线寄存器
+    reg signed [INPUT_MANT_W-1:0] pipe_data_s0 [0:FEATURE_SIZE-1];
 
-// 流水线寄存器
-reg [ACC_MANT_W-1:0] pipe_reg [0:PIPELINE_STAGES-1][0:31];
-reg [4:0] row_idx [0:PIPELINE_STAGES-1];
-reg [4:0] col_idx [0:PIPELINE_STAGES-1];
-reg pipe_valid [0:PIPELINE_STAGES-1];
+    reg signed [INPUT_MANT_W-1:0] pipe_k_s1    [0:FEATURE_SIZE-1];
+    reg signed [INPUT_MANT_W-1:0] pipe_b_s1    [0:FEATURE_SIZE-1];
+    reg signed [INPUT_MANT_W-1:0] pipe_data_s1 [0:FEATURE_SIZE-1];
 
-// 处理计数器
-reg [9:0] process_cnt;
-reg [4:0] curr_row, curr_col;
+    reg signed [INPUT_MANT_W-1:0] pipe_res_s2  [0:FEATURE_SIZE-1];
 
-// 状态机
-reg [2:0] state;
-localparam IDLE = 3'd0;
-localparam PROCESS = 3'd1;
-localparam FLUSH = 3'd2;
-localparam DONE = 3'd3;
-integer i;
-//==============================================================
-// 主处理逻辑
-//==============================================================
+    // 有效标志流水线
+    reg       pipe_valid   [0:PIPELINE_STAGES-1];
+    reg [4:0] row_idx_pipe [0:PIPELINE_STAGES-1];
 
-always @(posedge clk or negedge rst_n) begin:gelu2
-    if (!rst_n) begin
-        state <= IDLE;
-        done <= 1'b0;
-        process_cnt <= 10'd0;
-        curr_row <= 5'd0;
-        curr_col <= 5'd0;
-        h_out_exp <= {BFP_EXP_W{1'b0}};
-        
-        // 清空流水线
-        for (i = 0; i < PIPELINE_STAGES; i = i + 1) begin
-            pipe_valid[i] <= 1'b0;
-            row_idx[i] <= 5'd0;
-            col_idx[i] <= 5'd0;
+    // 行计数 (0 ~ MATRIX_SIZE-1)
+    reg [5:0] process_row_cnt;
+
+    // 循环变量
+    integer i, j0, j1, k2, m3;
+
+    // =========================================================================
+    // PWL 系数查找函数
+    //   输入：16 位有符号定点数 (Q3.12)
+    //   输出：{slope[15:0], intercept[15:0]}
+    // =========================================================================
+    function [31:0] get_pwl_coef;
+        input signed [INPUT_MANT_W-1:0] x;
+        reg [15:0] slope;
+        reg [15:0] intercept;
+        reg [3:0] seg_idx;
+        begin
+            // 使用 $signed() 保证常数是有符号比较
+            if (x >= $signed(16'h4000)) begin       // x >=  4.0
+                slope     = FIXED_ONE;
+                intercept = 16'd0;
+            end
+            else if (x <= $signed(16'hC000)) begin  // x <= -4.0
+                slope     = 16'd0;
+                intercept = 16'd0;
+            end
+            else begin
+                // 线性拟合区
+                seg_idx = x[14:11];
+                case (seg_idx)
+                    // === 正数部分 ===
+                    4'h0: begin slope = 16'h0B10; intercept = 16'h0000; end
+                    4'h1: begin slope = 16'h0FDC; intercept = 16'hFD9A; end
+                    4'h2: begin slope = 16'h11D7; intercept = 16'hFB9F; end // x=1.0 在此
+                    4'h3: begin slope = 16'h11C6; intercept = 16'hFBB9; end
+                    4'h4: begin slope = 16'h116E; intercept = 16'hFC69; end
+                    4'h5: begin slope = 16'h0FE6; intercept = 16'h003D; end
+                    4'h6: begin slope = 16'h101A; intercept = 16'hFFA1; end
+                    4'h7: begin slope = 16'h1008; intercept = 16'hFFE0; end
+
+                    // === 负数部分 ===
+                    4'h8: begin slope = 16'h0000; intercept = 16'h0000; end
+                    4'h9: begin slope = 16'hFFE4; intercept = 16'hFF9C; end
+                    4'hA: begin slope = 16'hFFA2; intercept = 16'hFED6; end
+                    4'hB: begin slope = 16'hFF0A; intercept = 16'hFD5A; end
+                    4'hC: begin slope = 16'hFE4A; intercept = 16'hFBDA; end
+                    4'hD: begin slope = 16'hFE16; intercept = 16'hFB8C; end
+                    4'hE: begin slope = 16'h0024; intercept = 16'hFD9A; end
+                    4'hF: begin slope = 16'h04EF; intercept = 16'h0000; end
+
+                    default: begin
+                        slope     = FIXED_ONE;
+                        intercept = 16'd0;
+                    end
+                endcase
+            end
+            get_pwl_coef = {slope, intercept};
         end
-        
-    end else begin
-        case (state)
-            IDLE: begin
-                done <= 1'b0;
-                if (start) begin
-                    state <= PROCESS;
-                    process_cnt <= 10'd0;
-                    curr_row <= 5'd0;
-                    curr_col <= 5'd0;
-                    h_out_exp <= h_in_exp;  // GELU保持指数不变（简化）
-                end
+    endfunction
+
+    // =========================================================================
+    // 1) 控制 / FSM / 有效标志流水线
+    //    这里只负责：state、busy、done、process_row_cnt、pipe_valid[]、
+    //    row_idx_pipe[]、out_exp 的时序更新。
+    // =========================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state           <= IDLE;
+            done            <= 1'b0;
+            busy            <= 1'b0;
+            process_row_cnt <= 6'd0;
+            out_exp         <= {TOKEN_CHUNK*BFP_EXP_W{1'b0}};
+
+            for (i = 0; i < PIPELINE_STAGES; i = i + 1) begin
+                pipe_valid[i]   <= 1'b0;
+                row_idx_pipe[i] <= 5'd0;
             end
-            
-            PROCESS: begin
-                // Stage 0: 输入
-                if (process_cnt < MATRIX_SIZE * FEATURE_SIZE) begin:process
-                    reg [ACC_MANT_W-1:0] input_val;
-                    
-                    // 提取输入值
-                    input_val = h_in_mant[(curr_row*FEATURE_SIZE + curr_col)*ACC_MANT_W +: ACC_MANT_W];
-                    
-                    // 送入流水线
-                    pipe_reg[0][curr_col] <= input_val;
-                    row_idx[0] <= curr_row;
-                    col_idx[0] <= curr_col;
-                    pipe_valid[0] <= 1'b1;
-                    
-                    // 更新索引
-                    if (curr_col == FEATURE_SIZE - 1) begin
-                        curr_col <= 5'd0;
-                        curr_row <= curr_row + 1;
-                    end else begin
-                        curr_col <= curr_col + 1;
-                    end
-                    
-                    process_cnt <= process_cnt + 1;
-                end else begin
-                    pipe_valid[0] <= 1'b0;
-                    if (!pipe_valid[PIPELINE_STAGES-1]) begin
-                        state <= DONE;
+        end
+        else begin
+            // 缺省：done 为 0（只在 DONE_STATE 拉高 1 个周期）
+            done <= 1'b0;
+
+            case (state)
+                // ------------------------------------------------------------
+                // IDLE：等待 start
+                // ------------------------------------------------------------
+                IDLE: begin
+                    busy            <= 1'b0;
+                    process_row_cnt <= 6'd0;
+
+                    // 进入新一轮处理
+                    if (start) begin
+                        state <= PROCESS;
+                        busy  <= 1'b1;
+                        out_exp <= in_exp;  // 指数直接透传
+
+                        for (i = 0; i < PIPELINE_STAGES; i = i + 1) begin
+                            pipe_valid[i]   <= 1'b0;
+                            row_idx_pipe[i] <= 5'd0;
+                        end
                     end
                 end
-                
-                // Stage 1: 地址计算
-                if (pipe_valid[0]) begin:adress
-                    reg [8:0] lut_addr;
-                    reg is_neg;
-                    
-                    is_neg = pipe_reg[0][col_idx[0]][ACC_MANT_W-1];
-                    if (is_neg) begin
-                        lut_addr = (-pipe_reg[0][col_idx[0]]) >> 6;
-                    end else begin
-                        lut_addr = pipe_reg[0][col_idx[0]] >> 6;
+
+                // ------------------------------------------------------------
+                // PROCESS：按行推进流水线
+                // ------------------------------------------------------------
+                PROCESS: begin
+                    busy <= 1'b1;
+
+                    // Stage0 有效标志（装载行）：
+                    // 只要还有未处理的行，就持续把 pipe_valid[0] 置 1
+                    if (process_row_cnt < MATRIX_SIZE) begin
+                        pipe_valid[0]   <= 1'b1;
+                        row_idx_pipe[0] <= process_row_cnt[4:0];
+                        process_row_cnt <= process_row_cnt + 1'b1;
                     end
-                    
-                    pipe_reg[1][col_idx[0]] <= {is_neg, lut_addr};
-                    row_idx[1] <= row_idx[0];
-                    col_idx[1] <= col_idx[0];
-                    pipe_valid[1] <= 1'b1;
-                end else begin
-                    pipe_valid[1] <= 1'b0;
-                end
-                
-                // Stage 2: 查表
-                if (pipe_valid[1]) begin:lut
-                    reg [ACC_MANT_W-1:0] lut_val;
-                    reg is_neg;
-                    reg [8:0] addr;
-                    
-                    {is_neg, addr} = pipe_reg[1][col_idx[1]];
-                    
-                    if (is_neg) begin
-                        lut_val = gelu_lut_neg[addr];
-                    end else begin
-                        lut_val = gelu_lut_pos[addr];
+                    else begin
+                        pipe_valid[0] <= 1'b0;
                     end
-                    
-                    pipe_reg[2][col_idx[1]] <= lut_val;
-                    row_idx[2] <= row_idx[1];
-                    col_idx[2] <= col_idx[1];
-                    pipe_valid[2] <= 1'b1;
-                end else begin
-                    pipe_valid[2] <= 1'b0;
+
+                    // 其余级的 valid / 行号 直接顺着流水线传递
+                    pipe_valid[1]   <= pipe_valid[0];
+                    pipe_valid[2]   <= pipe_valid[1];
+                    pipe_valid[3]   <= pipe_valid[2];
+
+                    row_idx_pipe[1] <= row_idx_pipe[0];
+                    row_idx_pipe[2] <= row_idx_pipe[1];
+                    row_idx_pipe[3] <= row_idx_pipe[2];
+
+                    // 当所有行已经送完，且流水线 4 级全部排空 → 进入 DONE
+                    if ((process_row_cnt >= MATRIX_SIZE) &&
+                        (pipe_valid[0] == 1'b0) &&
+                        (pipe_valid[1] == 1'b0) &&
+                        (pipe_valid[2] == 1'b0) &&
+                        (pipe_valid[3] == 1'b0)) begin
+                        state <= DONE_STATE;
+                    end
                 end
-                
-                // Stage 3: 输出
-                if (pipe_valid[2]) begin
-                    h_out_mant[(row_idx[2]*FEATURE_SIZE + col_idx[2])*ACC_MANT_W +: ACC_MANT_W] 
-                        <= pipe_reg[2][col_idx[2]];
-                    
-                    row_idx[3] <= row_idx[2];
-                    col_idx[3] <= col_idx[2];
-                    pipe_valid[3] <= 1'b1;
-                end else begin
-                    pipe_valid[3] <= 1'b0;
+
+                // ------------------------------------------------------------
+                // DONE_STATE：输出 done 脉冲 1 个周期，然后回到 IDLE
+                // ------------------------------------------------------------
+                DONE_STATE: begin
+                    busy <= 1'b0;
+                    done <= 1'b1;
+                    state <= IDLE;
                 end
-            end
-            
-            DONE: begin
-                done <= 1'b1;
-                state <= IDLE;
-            end
-        endcase
+
+                default: begin
+                    state <= IDLE;
+                end
+            endcase
+        end
     end
-end
+
+    // =========================================================================
+    // 2) Stage 0：按行加载输入数据 → pipe_data_s0[]
+    // =========================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (j0 = 0; j0 < FEATURE_SIZE; j0 = j0 + 1) begin
+                pipe_data_s0[j0] <= {INPUT_MANT_W{1'b0}};
+            end
+        end
+        else begin
+            // 只有在 PROCESS 状态下且有有效行输入时，才装载新数据
+            if ((state == PROCESS) && (process_row_cnt < MATRIX_SIZE)) begin
+                for (j0 = 0; j0 < FEATURE_SIZE; j0 = j0 + 1) begin
+                    pipe_data_s0[j0] <= $signed(
+                        in_mant[(process_row_cnt*FEATURE_SIZE + j0)*INPUT_MANT_W +: INPUT_MANT_W]
+                    );
+                end
+            end
+            // 其他情况保持原值（寄存器自然保持，不再写）
+        end
+    end
+
+    // =========================================================================
+    // 3) Stage 1：PWL 系数查找 → pipe_k_s1 / pipe_b_s1 + 数据直通 pipe_data_s1
+    // =========================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (j1 = 0; j1 < FEATURE_SIZE; j1 = j1 + 1) begin
+                pipe_k_s1[j1]    <= {INPUT_MANT_W{1'b0}};
+                pipe_b_s1[j1]    <= {INPUT_MANT_W{1'b0}};
+                pipe_data_s1[j1] <= {INPUT_MANT_W{1'b0}};
+            end
+        end
+        else begin
+            // 上一拍 pipe_valid[0]==1，说明本拍需要处理 Stage0 输出
+            if (pipe_valid[0]) begin
+                for (j1 = 0; j1 < FEATURE_SIZE; j1 = j1 + 1) begin
+                    {pipe_k_s1[j1], pipe_b_s1[j1]} <= get_pwl_coef(pipe_data_s0[j1]);
+                    pipe_data_s1[j1]               <= pipe_data_s0[j1];
+                end
+            end
+        end
+    end
+
+    // =========================================================================
+    // 4) Stage 2：乘加运算 → pipe_res_s2[]
+    // =========================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (k2 = 0; k2 < FEATURE_SIZE; k2 = k2 + 1) begin
+                pipe_res_s2[k2] <= {INPUT_MANT_W{1'b0}};
+            end
+        end
+        else begin
+            // 仅当上一拍 pipe_valid[1]==1 时才进行乘加
+            if (pipe_valid[1]) begin
+                for (k2 = 0; k2 < FEATURE_SIZE; k2 = k2 + 1) begin
+                    // 32 位乘法保持精度： (16b * 16b) -> 32b，然后 >>>12 再加 intercept
+                    pipe_res_s2[k2] <=
+                        ((32'sd0 + (pipe_data_s1[k2] * pipe_k_s1[k2])) >>> 12)
+                        + pipe_b_s1[k2];
+                end
+            end
+        end
+    end
+
+    // =========================================================================
+    // 5) Stage 3：截断并写入输出 out_mant[]
+    // =========================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            out_mant <= {MATRIX_SIZE*FEATURE_SIZE*OUTPUT_MANT_W{1'b0}};
+        end
+        else begin
+            // 仅当上一拍 pipe_valid[2]==1 时写对应行
+            if (pipe_valid[2]) begin
+                for (m3 = 0; m3 < FEATURE_SIZE; m3 = m3 + 1) begin
+                    if (INPUT_MANT_W > OUTPUT_MANT_W) begin
+                        // 直接取高位做截断
+                        out_mant[(row_idx_pipe[2]*FEATURE_SIZE + m3)*OUTPUT_MANT_W +: OUTPUT_MANT_W]
+                            <= pipe_res_s2[m3][INPUT_MANT_W-1 -: OUTPUT_MANT_W];
+                    end
+                    else begin
+                        // 位宽相等或更小的情况（简单起见直接取低位）
+                        out_mant[(row_idx_pipe[2]*FEATURE_SIZE + m3)*OUTPUT_MANT_W +: OUTPUT_MANT_W]
+                            <= pipe_res_s2[m3][OUTPUT_MANT_W-1:0];
+                    end
+                end
+            end
+        end
+    end
 
 endmodule

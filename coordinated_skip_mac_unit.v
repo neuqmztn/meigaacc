@@ -1,9 +1,4 @@
 `timescale 1ns / 1ps
-
-//==============================================================
-// 协调跳过 MAC 单元 (Coordinated Skip MAC Unit) - 最终修复版 (V3.1)
-//==============================================================
-
 module coordinated_skip_mac_unit(
     input  wire        clk,
     input  wire        rst_n,
@@ -23,15 +18,9 @@ module coordinated_skip_mac_unit(
     output reg         result_valid
 );
 
-    // 版本确认打印 (仿真开始时会显示)
-    initial begin
-        $display("---------------------------------------------------");
-        $display("LOADED: coordinated_skip_mac_unit V3.1 (Fixed Regs)");
-        $display("---------------------------------------------------");
-    end
 
     //==============================================================
-    // Stage 0: 输入寄存 (仅此处受 enable 控制)
+    // Stage 0: 输入寄存
     //==============================================================
     reg signed [7:0] A_reg, B_reg, C_reg, D_reg;
     reg unsigned_mode_A_reg, unsigned_mode_B_reg;
@@ -60,7 +49,6 @@ module coordinated_skip_mac_unit(
                 unsigned_mode_C_reg <= unsigned_mode_C;
                 unsigned_mode_D_reg <= unsigned_mode_D;
             end
-            // Valid 信号跟随流水线，不受 enable 关断影响
             stage0_valid <= enable; 
         end
     end
@@ -69,9 +57,6 @@ module coordinated_skip_mac_unit(
     // Stage 1: 逻辑计算 (基于 Stage 0 寄存器)
     //==============================================================
     
-    // [关键修复点] 
-    // 必须使用 A_reg/B_reg (寄存器值)，绝不能使用 A/B (输入端口值)
-    // 这样即使端口在下一拍变为0，Skip信号也会保持稳定。
     wire fast_zero_AB;
     wire fast_zero_CD;
     
@@ -133,7 +118,7 @@ module coordinated_skip_mac_unit(
     );
 
     //==============================================================
-    // Stage 2: 中间寄存 (自动移位，不需 enable 控制)
+    // Stage 2: 中间寄存
     //==============================================================
     reg signed [18:0] sum_stage2;
     reg stage2_valid;
@@ -144,7 +129,7 @@ module coordinated_skip_mac_unit(
             stage2_valid <= 1'b0;
         end else begin
             sum_stage2 <= sum_total;
-            stage2_valid <= stage0_valid; // 只要上一级有数据，就传下来
+            stage2_valid <= stage0_valid; 
         end
     end
 
