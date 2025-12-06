@@ -1,25 +1,5 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Sidenet Expand Engine v2.1
-//
-// 功能说明：
-// - 将Sidenet Transformer输出的8维特征扩展回32维
-// - 计算：output_i = W_expand × â_i
-// - 输入：â_i ∈ R^(N×8)，输出：output_i ∈ R^(N×32)
-// - 权重：W_expand ∈ R^(8×32)，每列独立共享指数
-//
-// 设计对称于Compression Engine：
-// - Compression: 32维 → 8维（降维）
-// - Expansion:   8维 → 32维（升维）
-//
-// 数据格式：16-bit BFP (blockBFP)
-// - 输入adapted：每个token有1个共享指数 + 8个尾数
-// - 输出expanded：每个token有1个共享指数 + 32个尾数
-// - 权重：32个共享指数（每列1个）+ 8×32个尾数
-//
-//================================================================================
-
 module sidenet_expand_engine #(
     parameter TOKEN_NUM      = 641,       // 总token数
     parameter TOKEN_BATCH    = 32,        // 每批处理的token数（保留，实际逐个）
@@ -534,7 +514,6 @@ compute_engine #(
     
     // 数据位宽
     .EXP_WIDTH(EXP_WIDTH),            // 指数8位
-    .MANT_WIDTH(DATA_WIDTH),          // 保留参数（兼容性）
     .INPUT_MANT_WIDTH(DATA_WIDTH),    // 输入尾数16位
     
     // 向量维度
@@ -546,10 +525,9 @@ compute_engine #(
     .INTERNAL_WIDTH(CE_INTERNAL_WIDTH),     // 内部39位
     .OUTPUT_WIDTH(CE_OUTPUT_WIDTH),         // 输出32位
     .GUARD_BITS(CE_GUARD_BITS),             // 保护位7位
-    .ENABLE_ROUNDING(CE_ENABLE_ROUNDING),   // 启用舍入
+    .ENABLE_ROUNDING(CE_ENABLE_ROUNDING) // 启用舍入
     
-    // FIFO配置
-    .FIFO_DEPTH(16)                   // FIFO深度
+
 ) u_compute_engine (
     .clk(clk),
     .rst_n(rst_n),
@@ -566,8 +544,7 @@ compute_engine #(
     //--------------------------------------------------------------------------
     .exp_X(adapted_exp_buf),          // Adapted的共享指数（1个，8位）
     .mant_X_block(adapted_mant_buf),  // Adapted的尾数（8×16位）
-    
-    // ✅ 权重：32个独立共享指数 + 尾数矩阵
+ 
     .exp_W_array(weight_exp_buf),     // 32个共享指数（32×8 = 256位）
     .mant_W_blocks(weight_mant_buf),  // 权重尾数（8×32×16位）
     
@@ -578,7 +555,7 @@ compute_engine #(
     .result_ready(1'b1),              // 始终就绪（输出被缓存寄存器采样）
     
     //--------------------------------------------------------------------------
-    // ✅ 输出数据（定点格式，连接到缓存寄存器采样）
+    //  输出数据
     //--------------------------------------------------------------------------
     .result_fixed_array(ce_result_fixed_array),      // 定点累加结果（32×32位）
     .result_base_exp_array(ce_result_base_exp_array),// 基础指数（32×9位）
@@ -632,69 +609,6 @@ assign dbg_state = state;
 // 仿真信息输出
 //================================================================================
 
-`ifdef SIMULATION
-
-initial begin
-    $display("========================================");
-    $display("Sidenet Expand Engine v2.1");
-    $display("========================================");
-    $display("Configuration:");
-    $display("  Input Dim:      %0d (compressed)", INPUT_DIM);
-    $display("  Output Dim:     %0d (expanded)", OUTPUT_DIM);
-    $display("  Tokens:         %0d", TOKEN_NUM);
-    $display("  Data Width:     %0d-bit BFP", DATA_WIDTH);
-    $display("  CE Output:      %0d-bit fixed-point", CE_OUTPUT_WIDTH);
-    $display("");
-    $display("New Features (v2.1):");
-    $display("  ✅ CE output buffering");
-    $display("  ✅ Timing safe");
-    $display("  ✅ No data loss");
-    $display("");
-    $display("Weight Format:");
-    $display("  - %0d shared exponents (per column)", OUTPUT_DIM);
-    $display("  - %0d×%0d mantissas", INPUT_DIM, OUTPUT_DIM);
-    $display("========================================");
-end
-
-// 监控CE握手
-always @(posedge clk) begin
-    if (ce_input_valid && !ce_input_ready) begin
-        $display("[WARNING] @%0t CE input not ready when valid asserted!", $time);
-    end
-end
-
-// 监控CE输出采样
-always @(posedge clk) begin
-    if (state == WAIT_COMPUTE && ce_compute_done && !ce_result_cached) begin
-        $display("[INFO] @%0t Sampling CE output for token %0d", $time, global_token_id);
-    end
-end
-
-// 监控BFP转换
-always @(posedge clk) begin
-    if (state == BFP_CONVERT && bfp_start) begin
-        $display("[INFO] @%0t Starting BFP conversion for token %0d", $time, global_token_id);
-    end
-end
-
-// 监控BFP溢出
-always @(posedge clk) begin
-    if (bfp_convert_done && bfp_overflow) begin
-        $display("[WARNING] @%0t BFP conversion overflow for token %0d!", 
-                 $time, global_token_id);
-    end
-end
-
-// 监控批次处理
-always @(posedge clk) begin
-    if (state == LOAD_ADAPTED && global_token_id % 32 == 0) begin
-        $display("[%0t] Expand: Processing batch %0d (tokens %0d-%0d), layer=%0d", 
-                 $time, current_batch, global_token_id, global_token_id + tokens_in_batch - 1,
-                 current_layer_id);
-    end
-end
-
-`endif
 
 //================================================================================
 // 参数合法性检查

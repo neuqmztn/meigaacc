@@ -1,21 +1,12 @@
 `timescale 1ns / 1ps
 
-//==============================================================
-// PE (Processing Unit) - v3.0 Final Fixed
-// 
-// 修复日志：
-// 1. MAC 输出位宽扩展至 19-bit (MAC_OUT_WIDTH)。
-// 2. 增加 INT16 模式下的混合符号控制 (Signed/Unsigned)。
-// 3. 修正 PE_B/PE_D 的路由逻辑，解决权重倒置问题。
-// 4. 保留 flush 清零和 initial 初始化功能。
-//==============================================================
 
 module PE #(
     parameter NUM_MAC        = 8,    // MAC 数量 (4 或 8)
     parameter ADDER_MODE     = 0,    // 0=INT8, 1=INT16
     parameter DATA_WIDTH     = 8,    // 输入数据位宽
-    parameter MAC_OUT_WIDTH  = 19,   // 【修复】修正为 19 位，匹配 MAC 单元最大输出
-    parameter FINAL_WIDTH    = 38    // 最终累加器位宽
+    parameter MAC_OUT_WIDTH  = 19,  
+    parameter FINAL_WIDTH    = 38    
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -34,7 +25,7 @@ module PE #(
 );
 
     //=============================================================================
-    // 1. 动态符号模式控制 logic (核心修复)
+    // 1. 动态符号模式控制 
     //=============================================================================
     // INT16 模式下，输入被拆分为 High(Signed) 和 Low(Unsigned)。
     // 根据 Packer_PE_B 的打包顺序：
@@ -288,20 +279,5 @@ module PE #(
         end
     end
 
-    //=============================================================================
-    // 仿真调试逻辑 (仅在仿真时有效)
-    //=============================================================================
-    `ifdef SIMULATION
-    always @(posedge clk) begin
-        if (result_valid && enable) begin
-            // 检测 X 态 (不定态)
-            if (^pe_result === 1'bx)
-                $display("[%0t] [ERROR] PE: pe_result contains X! ADDER_MODE=%0d", $time, ADDER_MODE);
-            // 检测 Z 态 (高阻态)
-            if (^pe_result === 1'bz)
-                $display("[%0t] [ERROR] PE: pe_result contains Z! ADDER_MODE=%0d", $time, ADDER_MODE);
-        end
-    end
-    `endif
 
 endmodule

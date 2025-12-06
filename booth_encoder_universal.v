@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 module booth_encoder_universal (
-    input  wire [7:0] multiplicand,   // 实际是 multiplier，那就保持名字不改了
+    input  wire [7:0] multiplicand,   
     input  wire       unsigned_mode,  // 0=有符号, 1=无符号
     output wire [14:0] k_packed       // 5 组编码 × 3bit = 15bit
 );

@@ -1,25 +1,15 @@
 `timescale 1ns / 1ps
 
-//==============================================================
-// BFP加法器 - 修复版
-// 
-// 关键修复：
-// 1. 正确的尾数扩展位宽
-// 2. 正确的指数补偿逻辑
-// 3. 正确的截取方式
-//==============================================================
-
 module bfp_adder #(
     parameter EXP_WIDTH = 8,
     parameter MANT_WIDTH = 16
 )(
     input  wire clk,
     input  wire rst_n,
-    
     input  wire enable,
     input  wire flush,
     
-    input  wire sign_a,
+    input  wire sign_a, 
     input  wire [EXP_WIDTH-1:0] exp_a,
     input  wire [MANT_WIDTH-1:0] mant_a,
     input  wire zero_a,
@@ -35,163 +25,79 @@ module bfp_adder #(
     output reg zero_out
 );
 
-//==============================================================
-// Stage 1: 输入寄存
-//==============================================================
-reg sign_a_r, sign_b_r;
-reg [EXP_WIDTH-1:0] exp_a_r, exp_b_r;
-reg [MANT_WIDTH-1:0] mant_a_r, mant_b_r;
-reg zero_a_r, zero_b_r;
+    //==============================================================
+    // Stage 1: 输入对齐 (Combinational or Registered)
+    // 为了时序更好，我们保持2级流水线
+    //==============================================================
+    
+    reg [EXP_WIDTH-1:0] st1_max_exp;
+    reg [MANT_WIDTH:0]  st1_mant_a_aligned; // 多1位用于进位
+    reg [MANT_WIDTH:0]  st1_mant_b_aligned;
+    reg                 st1_valid;
 
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        sign_a_r <= 1'b0;
-        sign_b_r <= 1'b0;
-        exp_a_r <= {EXP_WIDTH{1'b0}};
-        exp_b_r <= {EXP_WIDTH{1'b0}};
-        mant_a_r <= {MANT_WIDTH{1'b0}};
-        mant_b_r <= {MANT_WIDTH{1'b0}};
-        zero_a_r <= 1'b1;
-        zero_b_r <= 1'b1;
-    end else if (flush) begin
-        zero_a_r <= 1'b1;
-        zero_b_r <= 1'b1;
-    end else if (enable) begin
-        sign_a_r <= sign_a;
-        sign_b_r <= sign_b;
-        exp_a_r <= exp_a;
-        exp_b_r <= exp_b;
-        mant_a_r <= mant_a;
-        mant_b_r <= mant_b;
-        zero_a_r <= zero_a;
-        zero_b_r <= zero_b;
-    end
-end
-
-//==============================================================
-// Stage 2: 组合逻辑计算
-//==============================================================
-
-// 特殊情况
-wire both_zero = zero_a_r & zero_b_r;
-wire only_a_valid = (~zero_a_r) & zero_b_r;
-wire only_b_valid = zero_a_r & (~zero_b_r);
-
-// 指数对齐
-wire exp_a_larger = (exp_a_r > exp_b_r);
-wire exp_equal = (exp_a_r == exp_b_r);
-wire [EXP_WIDTH-1:0] exp_diff = exp_a_larger ? (exp_a_r - exp_b_r) : (exp_b_r - exp_a_r);
-wire [EXP_WIDTH-1:0] exp_max = exp_a_larger ? exp_a_r : exp_b_r;
-
-// ✅ 关键修复：使用3位保护位（不是4位！）
-// 扩展格式：{mant[15:0], 3'b000} = 19-bit
-wire [MANT_WIDTH+2:0] mant_a_ext = exp_a_larger ? {mant_a_r, 3'b000} : 
-                                    (exp_diff < MANT_WIDTH+3) ? ({mant_a_r, 3'b000} >> exp_diff) : 
-                                    {(MANT_WIDTH+3){1'b0}};
-
-wire [MANT_WIDTH+2:0] mant_b_ext = exp_a_larger ? 
-                                    (exp_diff < MANT_WIDTH+3) ? ({mant_b_r, 3'b000} >> exp_diff) : 
-                                    {(MANT_WIDTH+3){1'b0}} :
-                                    {mant_b_r, 3'b000};
-
-// 加减法控制
-wire sign_same = (sign_a_r == sign_b_r);
-wire a_larger_mag = exp_a_larger || (exp_equal && (mant_a_r >= mant_b_r));
-
-// ✅ 修复：使用20-bit来防止溢出
-wire [MANT_WIDTH+3:0] mant_sum = sign_same ? 
-                                  ({1'b0, mant_a_ext} + {1'b0, mant_b_ext}) :
-                                  (a_larger_mag ? 
-                                   ({1'b0, mant_a_ext} - {1'b0, mant_b_ext}) :
-                                   ({1'b0, mant_b_ext} - {1'b0, mant_a_ext}));
-
-// 结果符号
-wire result_sign = sign_same ? sign_a_r : (a_larger_mag ? sign_a_r : sign_b_r);
-
-// 前导零检测
-function integer clz;
-    input [MANT_WIDTH+3:0] value;
-    integer i;
-    reg found;
-    begin
-        clz = MANT_WIDTH + 4;
-        found = 0;
-        for (i = MANT_WIDTH+3; i >= 0; i = i - 1) begin
-            if (!found && value[i] == 1'b1) begin
-                clz = MANT_WIDTH + 3 - i;
-                found = 1;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            st1_max_exp <= 0;
+            st1_mant_a_aligned <= 0;
+            st1_mant_b_aligned <= 0;
+            st1_valid <= 0;
+        end else if (flush) begin
+            st1_valid <= 0;
+        end else if (enable) begin
+            st1_valid <= 1;
+            
+            // 简单的对齐逻辑：谁的指数小，谁右移
+            if (exp_a >= exp_b) begin
+                st1_max_exp <= exp_a;
+                st1_mant_a_aligned <= {1'b0, mant_a}; // 扩展一位
+                // 限制移位最大值，防止逻辑过于复杂
+                if ((exp_a - exp_b) > MANT_WIDTH)
+                    st1_mant_b_aligned <= 0;
+                else
+                    st1_mant_b_aligned <= {1'b0, mant_b} >> (exp_a - exp_b);
+            end else begin
+                st1_max_exp <= exp_b;
+                st1_mant_b_aligned <= {1'b0, mant_b};
+                if ((exp_b - exp_a) > MANT_WIDTH)
+                    st1_mant_a_aligned <= 0;
+                else
+                    st1_mant_a_aligned <= {1'b0, mant_a} >> (exp_b - exp_a);
             end
-        end
-    end
-endfunction
-
-wire [EXP_WIDTH-1:0] leading_zeros = clz(mant_sum);
-
-// 归一化
-wire overflow = mant_sum[MANT_WIDTH+3];  // bit[19]
-
-wire [MANT_WIDTH+3:0] mant_normalized;
-wire [EXP_WIDTH:0] exp_normalized;
-
-assign mant_normalized = overflow ? (mant_sum >> 1) : 
-                         (leading_zeros > 0 && leading_zeros < MANT_WIDTH+4) ? 
-                         (mant_sum << leading_zeros) : 
-                         mant_sum;
-
-// ✅ 关键修复：指数调整
-assign exp_normalized = overflow ? ({1'b0, exp_max} + 9'd1) :
-                        (leading_zeros > 0 && {1'b0, exp_max} >= {1'b0, leading_zeros}) ? 
-                        ({1'b0, exp_max} - {1'b0, leading_zeros}) :
-                        9'd0;
-
-// ✅ 修复：正确的截取 [18:3]
-// 因为扩展了3位，所以截取[MANT_WIDTH+2:3]
-wire [MANT_WIDTH-1:0] mant_result = mant_normalized[MANT_WIDTH+2:3];
-
-wire result_is_zero = (mant_sum == 0) || both_zero;
-
-//==============================================================
-// Stage 3: 输出寄存
-//==============================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        sign_out <= 1'b0;
-        exp_out <= {EXP_WIDTH{1'b0}};
-        mant_out <= {MANT_WIDTH{1'b0}};
-        zero_out <= 1'b1;
-    end else if (flush) begin
-        sign_out <= 1'b0;
-        exp_out <= {EXP_WIDTH{1'b0}};
-        mant_out <= {MANT_WIDTH{1'b0}};
-        zero_out <= 1'b1;
-    end else if (enable) begin
-        if (both_zero) begin
-            sign_out <= 1'b0;
-            exp_out <= {EXP_WIDTH{1'b0}};
-            mant_out <= {MANT_WIDTH{1'b0}};
-            zero_out <= 1'b1;
-        end else if (only_a_valid) begin
-            sign_out <= sign_a_r;
-            exp_out <= exp_a_r;
-            mant_out <= mant_a_r;
-            zero_out <= 1'b0;
-        end else if (only_b_valid) begin
-            sign_out <= sign_b_r;
-            exp_out <= exp_b_r;
-            mant_out <= mant_b_r;
-            zero_out <= 1'b0;
-        end else if (result_is_zero) begin
-            sign_out <= 1'b0;
-            exp_out <= {EXP_WIDTH{1'b0}};
-            mant_out <= {MANT_WIDTH{1'b0}};
-            zero_out <= 1'b1;
         end else begin
-            sign_out <= result_sign;
-            exp_out <= exp_normalized[EXP_WIDTH-1:0];
-            mant_out <= mant_result;
-            zero_out <= 1'b0;
+            st1_valid <= 0;
         end
     end
-end
+
+    //==============================================================
+    // Stage 2: 加法与溢出处理
+    //==============================================================
+    
+    reg [MANT_WIDTH+1:0] sum_raw; // 17 bits
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            exp_out <= 0;
+            mant_out <= 0;
+            zero_out <= 1;
+            sign_out <= 0;
+        end else if (st1_valid) begin
+            // 执行加法
+            sum_raw = st1_mant_a_aligned + st1_mant_b_aligned;
+            
+            // 检查溢出 (Bit 16 is 1?)
+            if (sum_raw[MANT_WIDTH]) begin
+                // 发生溢出，右移1位，指数+1
+                mant_out <= sum_raw[MANT_WIDTH:1];
+                exp_out  <= st1_max_exp + 1;
+            end else begin
+                // 无溢出，保持原样
+                mant_out <= sum_raw[MANT_WIDTH-1:0];
+                exp_out  <= st1_max_exp;
+            end
+            
+            zero_out <= (sum_raw == 0);
+            sign_out <= 0; // 始终为正
+        end
+    end
 
 endmodule

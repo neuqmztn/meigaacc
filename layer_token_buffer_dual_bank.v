@@ -22,6 +22,7 @@
 // Layer 2: 从BANK A读 → 处理 → 写BANK B (乓)
 // Layer 3: 从BANK B读 → 处理 → 写BANK A (乒)
 //================================================================================
+`timescale 1ns / 1ps
 
 module layer_token_buffer_dual_bank #(
     parameter TOKEN_NUM   = 641,
@@ -33,67 +34,49 @@ module layer_token_buffer_dual_bank #(
     input  wire clk,
     input  wire rst_n,
     
-    //==========================================================================
-    // 控制信号
-    //==========================================================================
-    input  wire bank_swap,                    // 层切换时脉冲，翻转BANK选择
-    output wire current_read_bank,            // 当前读哪个BANK (0=A, 1=B)
-    output wire current_write_bank,           // 当前写哪个BANK (0=A, 1=B)
+    // Control
+    input  wire bank_swap,
+    output wire current_read_bank,
+    output wire current_write_bank,
     
-    //==========================================================================
-    // Backbone读接口 (Port A) - 连接到Attention/FFN/Residual等模块
-    //==========================================================================
+    // Port A (Backbone Read)
     input  wire backbone_rd_en,
     input  wire [ADDR_WIDTH-1:0] backbone_rd_addr,
     output wire [EXP_WIDTH-1:0] backbone_rd_exp,
     output wire [DIM*MANT_WIDTH-1:0] backbone_rd_mant,
     output wire backbone_rd_valid,
     
-    //==========================================================================
-    // Sidenet读接口 (Port B) - 连接到Sidenet处理
-    //==========================================================================
+    // Port B (Sidenet Read)
     input  wire sidenet_rd_en,
     input  wire [ADDR_WIDTH-1:0] sidenet_rd_addr,
     output wire [EXP_WIDTH-1:0] sidenet_rd_exp,
     output wire [DIM*MANT_WIDTH-1:0] sidenet_rd_mant,
     output wire sidenet_rd_valid,
     
-    //==========================================================================
-    // 写接口 - 连接到当前层的输出（经过完整Block处理）
-    //==========================================================================
+    // Write Port
     input  wire layer_wr_en,
     input  wire [ADDR_WIDTH-1:0] layer_wr_addr,
     input  wire [EXP_WIDTH-1:0] layer_wr_exp,
     input  wire [DIM*MANT_WIDTH-1:0] layer_wr_mant,
     output wire layer_wr_ready,
     
-    //==========================================================================
-    // DRAM加载接口 - 初始输入加载到BANK A
-    //==========================================================================
+    // DRAM Load/Store & LN1
     input  wire dram_load_en,
     input  wire [ADDR_WIDTH-1:0] dram_load_addr,
     input  wire [EXP_WIDTH-1:0] dram_load_exp,
     input  wire [DIM*MANT_WIDTH-1:0] dram_load_mant,
     
-    //==========================================================================
-    // DRAM存储接口 - 最终输出从当前写BANK读出
-    //==========================================================================
     input  wire dram_store_en,
     input  wire [ADDR_WIDTH-1:0] dram_store_addr,
     output wire [EXP_WIDTH-1:0] dram_store_exp,
     output wire [DIM*MANT_WIDTH-1:0] dram_store_mant,
     output wire dram_store_valid,
     
-    //==========================================================================
-    // LN1暂存接口 - LayerNorm1输出暂存，供Residual2使用
-    //==========================================================================
-    // LN1保存接口 - LayerNorm1输出写入写BANK
     input  wire ln1_save_en,
     input  wire [ADDR_WIDTH-1:0] ln1_save_addr,
     input  wire [EXP_WIDTH-1:0] ln1_save_exp,
     input  wire [DIM*MANT_WIDTH-1:0] ln1_save_mant,
     
-    // LN1加载接口 - Residual2从写BANK读取LN1暂存
     input  wire ln1_load_en,
     input  wire [ADDR_WIDTH-1:0] ln1_load_addr,
     output wire [EXP_WIDTH-1:0] ln1_load_exp,
@@ -101,255 +84,209 @@ module layer_token_buffer_dual_bank #(
     output wire ln1_load_valid
 );
 
-//================================================================================
-// 内部信号定义
-//================================================================================
-
-// BANK选择寄存器
-// 0: BANK A读，BANK B写
-// 1: BANK B读，BANK A写
-reg bank_select_reg;
-
-// BANK A 存储器 (指数和尾数分开存储)
-reg [EXP_WIDTH-1:0] bank_a_exp_mem [0:TOKEN_NUM-1];
-reg [DIM*MANT_WIDTH-1:0] bank_a_mant_mem [0:TOKEN_NUM-1];
-
-// BANK B 存储器
-reg [EXP_WIDTH-1:0] bank_b_exp_mem [0:TOKEN_NUM-1];
-reg [DIM*MANT_WIDTH-1:0] bank_b_mant_mem [0:TOKEN_NUM-1];
-
-// 读数据寄存器（用于流水线）
-reg [EXP_WIDTH-1:0] backbone_rd_exp_reg;
-reg [DIM*MANT_WIDTH-1:0] backbone_rd_mant_reg;
-reg backbone_rd_valid_reg;
-
-reg [EXP_WIDTH-1:0] sidenet_rd_exp_reg;
-reg [DIM*MANT_WIDTH-1:0] sidenet_rd_mant_reg;
-reg sidenet_rd_valid_reg;
-
-reg [EXP_WIDTH-1:0] dram_store_exp_reg;
-reg [DIM*MANT_WIDTH-1:0] dram_store_mant_reg;
-reg dram_store_valid_reg;
-
-// LN1 load输出寄存器
-reg [EXP_WIDTH-1:0] ln1_load_exp_reg;
-reg [DIM*MANT_WIDTH-1:0] ln1_load_mant_reg;
-reg ln1_load_valid_reg;
-
-// 写使能信号（分解到各BANK）
-wire bank_a_wr_en;
-wire bank_b_wr_en;
-
-// 写地址和数据（公共）
-wire [ADDR_WIDTH-1:0] wr_addr;
-wire [EXP_WIDTH-1:0] wr_exp;
-wire [DIM*MANT_WIDTH-1:0] wr_mant;
-
-//================================================================================
-// BANK选择控制逻辑
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        bank_select_reg <= 1'b0;  // 复位：读BANK A，写BANK B
-    end else if (bank_swap) begin
-        bank_select_reg <= ~bank_select_reg;  // 翻转BANK
-    end
-end
-
-assign current_read_bank = bank_select_reg;
-assign current_write_bank = ~bank_select_reg;
-
-//================================================================================
-// 写入逻辑
-//================================================================================
-
-// 写入源多路选择：层输出 或 DRAM加载 或 LN1暂存
-assign wr_addr = dram_load_en ? dram_load_addr : 
-                 ln1_save_en  ? ln1_save_addr  : 
-                 layer_wr_addr;
-                 
-assign wr_exp  = dram_load_en ? dram_load_exp  : 
-                 ln1_save_en  ? ln1_save_exp   : 
-                 layer_wr_exp;
-                 
-assign wr_mant = dram_load_en ? dram_load_mant : 
-                 ln1_save_en  ? ln1_save_mant  : 
-                 layer_wr_mant;
-
-// BANK写使能控制
-// DRAM加载：始终写BANK A（初始状态）
-// LN1暂存：写当前write_bank（写BANK，与layer_wr互斥）
-// 层输出：写当前write_bank
-assign bank_a_wr_en = dram_load_en || ((layer_wr_en || ln1_save_en) && ~bank_select_reg);
-assign bank_b_wr_en = (layer_wr_en || ln1_save_en) && bank_select_reg;
-
-// BANK A 写入
-always @(posedge clk) begin
-    if (bank_a_wr_en) begin
-        bank_a_exp_mem[wr_addr]  <= wr_exp;
-        bank_a_mant_mem[wr_addr] <= wr_mant;
-    end
-end
-
-// BANK B 写入
-always @(posedge clk) begin
-    if (bank_b_wr_en) begin
-        bank_b_exp_mem[wr_addr]  <= wr_exp;
-        bank_b_mant_mem[wr_addr] <= wr_mant;
-    end
-end
-
-assign layer_wr_ready = 1'b1;  // 简化：假设总是ready
-
-//================================================================================
-// Backbone读取逻辑 (Port A) - 从当前read_bank读
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        backbone_rd_valid_reg <= 1'b0;
-        backbone_rd_exp_reg   <= {EXP_WIDTH{1'b0}};
-        backbone_rd_mant_reg  <= {(DIM*MANT_WIDTH){1'b0}};
-    end else begin
-        backbone_rd_valid_reg <= backbone_rd_en;
-        
-        if (backbone_rd_en) begin
-            if (bank_select_reg == 1'b0) begin
-                // 读BANK A
-                backbone_rd_exp_reg  <= bank_a_exp_mem[backbone_rd_addr];
-                backbone_rd_mant_reg <= bank_a_mant_mem[backbone_rd_addr];
-            end else begin
-                // 读BANK B
-                backbone_rd_exp_reg  <= bank_b_exp_mem[backbone_rd_addr];
-                backbone_rd_mant_reg <= bank_b_mant_mem[backbone_rd_addr];
-            end
-        end
-    end
-end
-
-assign backbone_rd_exp   = backbone_rd_exp_reg;
-assign backbone_rd_mant  = backbone_rd_mant_reg;
-assign backbone_rd_valid = backbone_rd_valid_reg;
-
-//================================================================================
-// Sidenet读取逻辑 (Port B) - 从当前read_bank读
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        sidenet_rd_valid_reg <= 1'b0;
-        sidenet_rd_exp_reg   <= {EXP_WIDTH{1'b0}};
-        sidenet_rd_mant_reg  <= {(DIM*MANT_WIDTH){1'b0}};
-    end else begin
-        sidenet_rd_valid_reg <= sidenet_rd_en;
-        
-        if (sidenet_rd_en) begin
-            if (bank_select_reg == 1'b0) begin
-                // 读BANK A
-                sidenet_rd_exp_reg  <= bank_a_exp_mem[sidenet_rd_addr];
-                sidenet_rd_mant_reg <= bank_a_mant_mem[sidenet_rd_addr];
-            end else begin
-                // 读BANK B
-                sidenet_rd_exp_reg  <= bank_b_exp_mem[sidenet_rd_addr];
-                sidenet_rd_mant_reg <= bank_b_mant_mem[sidenet_rd_addr];
-            end
-        end
-    end
-end
-
-assign sidenet_rd_exp   = sidenet_rd_exp_reg;
-assign sidenet_rd_mant  = sidenet_rd_mant_reg;
-assign sidenet_rd_valid = sidenet_rd_valid_reg;
-
-//================================================================================
-// DRAM存储读取逻辑 - 从当前write_bank读（最终输出在write_bank）
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dram_store_valid_reg <= 1'b0;
-        dram_store_exp_reg   <= {EXP_WIDTH{1'b0}};
-        dram_store_mant_reg  <= {(DIM*MANT_WIDTH){1'b0}};
-    end else begin
-        dram_store_valid_reg <= dram_store_en;
-        
-        if (dram_store_en) begin
-            if (bank_select_reg == 1'b0) begin
-                // 最终输出在BANK B (当前write bank)
-                dram_store_exp_reg  <= bank_b_exp_mem[dram_store_addr];
-                dram_store_mant_reg <= bank_b_mant_mem[dram_store_addr];
-            end else begin
-                // 最终输出在BANK A
-                dram_store_exp_reg  <= bank_a_exp_mem[dram_store_addr];
-                dram_store_mant_reg <= bank_a_mant_mem[dram_store_addr];
-            end
-        end
-    end
-end
-
-assign dram_store_exp   = dram_store_exp_reg;
-assign dram_store_mant  = dram_store_mant_reg;
-assign dram_store_valid = dram_store_valid_reg;
-
-//================================================================================
-// LN1加载读取逻辑 - 从当前write_bank读（LN1暂存在write_bank）
-//================================================================================
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        ln1_load_valid_reg <= 1'b0;
-        ln1_load_exp_reg   <= {EXP_WIDTH{1'b0}};
-        ln1_load_mant_reg  <= {(DIM*MANT_WIDTH){1'b0}};
-    end else begin
-        ln1_load_valid_reg <= ln1_load_en;
-        
-        if (ln1_load_en) begin
-            if (bank_select_reg == 1'b0) begin
-                // 写BANK是B，从BANK B读取LN1暂存
-                ln1_load_exp_reg  <= bank_b_exp_mem[ln1_load_addr];
-                ln1_load_mant_reg <= bank_b_mant_mem[ln1_load_addr];
-            end else begin
-                // 写BANK是A，从BANK A读取LN1暂存
-                ln1_load_exp_reg  <= bank_a_exp_mem[ln1_load_addr];
-                ln1_load_mant_reg <= bank_a_mant_mem[ln1_load_addr];
-            end
-        end
-    end
-end
-
-assign ln1_load_exp   = ln1_load_exp_reg;
-assign ln1_load_mant  = ln1_load_mant_reg;
-assign ln1_load_valid = ln1_load_valid_reg;
-
-//================================================================================
-// 仿真初始化
-//================================================================================
-
-`ifdef SIMULATION
-integer i;
-initial begin
-    $display("========================================");
-    $display("Layer Token Buffer Dual-BANK");
-    $display("========================================");
-    $display("Configuration:");
-    $display("  Tokens:        %0d", TOKEN_NUM);
-    $display("  Dimension:     %0d", DIM);
-    $display("  Exponent bits: %0d", EXP_WIDTH);
-    $display("  Mantissa bits: %0d per dim", MANT_WIDTH);
-    $display("  Total bits:    %0d per token", EXP_WIDTH + DIM*MANT_WIDTH);
-    $display("  BANK size:     %0d KB", (TOKEN_NUM * (EXP_WIDTH + DIM*MANT_WIDTH)) / 8 / 1024);
-    $display("  Total size:    %0d KB", 2 * (TOKEN_NUM * (EXP_WIDTH + DIM*MANT_WIDTH)) / 8 / 1024);
-    $display("========================================");
+    //==========================================================================
+    // 1. BANK Management
+    //==========================================================================
+    reg bank_select_reg; 
     
-    // 初始化存储器（避免X态）
-    for (i = 0; i < TOKEN_NUM; i = i + 1) begin
-        bank_a_exp_mem[i] = {EXP_WIDTH{1'b0}};
-        bank_a_mant_mem[i] = {(DIM*MANT_WIDTH){1'b0}};
-        bank_b_exp_mem[i] = {EXP_WIDTH{1'b0}};
-        bank_b_mant_mem[i] = {(DIM*MANT_WIDTH){1'b0}};
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) bank_select_reg <= 1'b0;
+        else if (bank_swap) bank_select_reg <= ~bank_select_reg;
     end
-end
+
+    assign current_read_bank  = bank_select_reg;
+    assign current_write_bank = ~bank_select_reg;
+
+    //==========================================================================
+    // 2. Physical Port Mapping
+    //==========================================================================
+    
+    // --- Write Bus Aggregation ---
+    wire common_wr_en;
+    wire [ADDR_WIDTH-1:0] common_wr_addr;
+    wire [EXP_WIDTH-1:0] common_wr_exp;
+    wire [DIM*MANT_WIDTH-1:0] common_wr_mant;
+    
+    assign common_wr_en = dram_load_en || ln1_save_en || layer_wr_en;
+    
+    assign common_wr_addr = dram_load_en ? dram_load_addr : 
+                            ln1_save_en  ? ln1_save_addr  : 
+                            layer_wr_addr;
+                            
+    assign common_wr_exp  = dram_load_en ? dram_load_exp  : 
+                            ln1_save_en  ? ln1_save_exp   : 
+                            layer_wr_exp;
+
+    assign common_wr_mant = dram_load_en ? dram_load_mant : 
+                            ln1_save_en  ? ln1_save_mant  : 
+                            layer_wr_mant;
+
+    assign layer_wr_ready = 1'b1;
+
+    // --- Port Address / Write Control Logic ---
+    // Definition for Port A and Port B inputs for both banks
+    
+    reg        bank_a_we_a;
+    reg [ADDR_WIDTH-1:0] bank_a_addr_a;
+    reg [ADDR_WIDTH-1:0] bank_a_addr_b;
+
+    reg        bank_b_we_a;
+    reg [ADDR_WIDTH-1:0] bank_b_addr_a;
+    reg [ADDR_WIDTH-1:0] bank_b_addr_b;
+
+    // BANK A Control
+    always @(*) begin
+        // Port A: Handles Writes OR Backbone/Aux Read
+        if (dram_load_en) begin
+            bank_a_we_a   = 1'b1;
+            bank_a_addr_a = dram_load_addr;
+        end 
+        else if (bank_select_reg == 1'b1) begin // Write Mode
+            bank_a_we_a   = common_wr_en;
+            bank_a_addr_a = common_wr_addr;
+        end 
+        else begin // Read Mode
+            bank_a_we_a   = 1'b0;
+            if (backbone_rd_en)      bank_a_addr_a = backbone_rd_addr;
+            else if (dram_store_en)  bank_a_addr_a = dram_store_addr;
+            else if (ln1_load_en)    bank_a_addr_a = ln1_load_addr;
+            else                     bank_a_addr_a = backbone_rd_addr;
+        end
+
+        // Port B: Handles Sidenet Read only
+        bank_a_addr_b = sidenet_rd_addr;
+    end
+
+    // BANK B Control
+    always @(*) begin
+        // Port A: Handles Writes OR Backbone/Aux Read
+        if (bank_select_reg == 1'b0) begin // Write Mode
+            bank_b_we_a   = common_wr_en;
+            bank_b_addr_a = common_wr_addr;
+        end 
+        else begin // Read Mode
+            bank_b_we_a   = 1'b0;
+            if (backbone_rd_en)      bank_b_addr_a = backbone_rd_addr;
+            else if (dram_store_en)  bank_b_addr_a = dram_store_addr;
+            else if (ln1_load_en)    bank_b_addr_a = ln1_load_addr;
+            else                     bank_b_addr_a = backbone_rd_addr;
+        end
+
+        // Port B: Handles Sidenet Read only
+        bank_b_addr_b = sidenet_rd_addr;
+    end
+
+    //==========================================================================
+    // 3. BRAM Instantiation (TRUE DUAL PORT, SYNCHRONOUS READ)
+    //==========================================================================
+    
+    // ---------------- BANK A ----------------
+    (* ram_style = "block" *) reg [EXP_WIDTH-1:0] bank_a_exp_mem [0:TOKEN_NUM-1];
+    (* ram_style = "block" *) reg [DIM*MANT_WIDTH-1:0] bank_a_mant_mem [0:TOKEN_NUM-1];
+    
+    reg [EXP_WIDTH-1:0]      bank_a_dout_exp_a, bank_a_dout_exp_b;
+    reg [DIM*MANT_WIDTH-1:0] bank_a_dout_mant_a, bank_a_dout_mant_b;
+
+    // Port A (Read/Write)
+    always @(posedge clk) begin
+        if (bank_a_we_a) begin
+            bank_a_exp_mem[bank_a_addr_a]  <= common_wr_exp;
+            bank_a_mant_mem[bank_a_addr_a] <= common_wr_mant;
+        end
+        // SYNCHRONOUS READ: Always read, result available next cycle
+        bank_a_dout_exp_a  <= bank_a_exp_mem[bank_a_addr_a];
+        bank_a_dout_mant_a <= bank_a_mant_mem[bank_a_addr_a];
+    end
+
+    // Port B (Read Only)
+    always @(posedge clk) begin
+        bank_a_dout_exp_b  <= bank_a_exp_mem[bank_a_addr_b];
+        bank_a_dout_mant_b <= bank_a_mant_mem[bank_a_addr_b];
+    end
+
+    // ---------------- BANK B ----------------
+    (* ram_style = "block" *) reg [EXP_WIDTH-1:0] bank_b_exp_mem [0:TOKEN_NUM-1];
+    (* ram_style = "block" *) reg [DIM*MANT_WIDTH-1:0] bank_b_mant_mem [0:TOKEN_NUM-1];
+
+    reg [EXP_WIDTH-1:0]      bank_b_dout_exp_a, bank_b_dout_exp_b;
+    reg [DIM*MANT_WIDTH-1:0] bank_b_dout_mant_a, bank_b_dout_mant_b;
+
+    // Port A (Read/Write)
+    always @(posedge clk) begin
+        if (bank_b_we_a) begin
+            bank_b_exp_mem[bank_b_addr_a]  <= common_wr_exp;
+            bank_b_mant_mem[bank_b_addr_a] <= common_wr_mant;
+        end
+        // SYNCHRONOUS READ
+        bank_b_dout_exp_a  <= bank_b_exp_mem[bank_b_addr_a];
+        bank_b_dout_mant_a <= bank_b_mant_mem[bank_b_addr_a];
+    end
+
+    // Port B (Read Only)
+    always @(posedge clk) begin
+        bank_b_dout_exp_b  <= bank_b_exp_mem[bank_b_addr_b];
+        bank_b_dout_mant_b <= bank_b_mant_mem[bank_b_addr_b];
+    end
+
+    //==========================================================================
+    // 4. Output Muxing (Comb Logic after BRAM Regs)
+    //==========================================================================
+    // 由于 BRAM 输出已经是寄存器输出（delayed by 1 clk），
+    // 这里的 MUX 只是组合逻辑选择，不需要再打一拍，
+    // 从而保证从输入地址到 valid 只有 1 个周期的延迟。
+
+    // BACKBONE
+    assign backbone_rd_exp  = (bank_select_reg == 0) ? bank_a_dout_exp_a  : bank_b_dout_exp_a;
+    assign backbone_rd_mant = (bank_select_reg == 0) ? bank_a_dout_mant_a : bank_b_dout_mant_a;
+    
+    // Generate Valid Signal (Delayed by 1 cycle to match BRAM latency)
+    reg bb_valid_reg;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) bb_valid_reg <= 0;
+        else bb_valid_reg <= backbone_rd_en;
+    end
+    assign backbone_rd_valid = bb_valid_reg;
+
+    // SIDENET
+    assign sidenet_rd_exp  = (bank_select_reg == 0) ? bank_a_dout_exp_b  : bank_b_dout_exp_b;
+    assign sidenet_rd_mant = (bank_select_reg == 0) ? bank_a_dout_mant_b : bank_b_dout_mant_b;
+    
+    reg sn_valid_reg;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) sn_valid_reg <= 0;
+        else sn_valid_reg <= sidenet_rd_en;
+    end
+    assign sidenet_rd_valid = sn_valid_reg;
+
+    // DRAM STORE & LN1 LOAD (From Port A)
+    assign dram_store_exp  = (bank_select_reg == 0) ? bank_a_dout_exp_a  : bank_b_dout_exp_a;
+    assign dram_store_mant = (bank_select_reg == 0) ? bank_a_dout_mant_a : bank_b_dout_mant_a;
+    assign ln1_load_exp    = dram_store_exp;
+    assign ln1_load_mant   = dram_store_mant;
+
+    reg ds_valid_reg;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) ds_valid_reg <= 0;
+        else ds_valid_reg <= dram_store_en;
+    end
+    assign dram_store_valid = ds_valid_reg;
+
+    reg ln1_valid_reg;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) ln1_valid_reg <= 0;
+        else ln1_valid_reg <= ln1_load_en;
+    end
+    assign ln1_load_valid = ln1_valid_reg;
+
+    // Simulation Init
+`ifdef SIMULATION
+    integer i;
+    initial begin
+        for (i = 0; i < TOKEN_NUM; i = i + 1) begin
+            bank_a_exp_mem[i]  = 0; bank_a_mant_mem[i] = 0;
+            bank_b_exp_mem[i]  = 0; bank_b_mant_mem[i] = 0;
+        end
+    end
 `endif
 
 endmodule

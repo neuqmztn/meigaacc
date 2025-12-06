@@ -1,33 +1,10 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// SideNet Layer 4 - 最终扩展层模块
-//
-// 功能：
-// Layer 4是SideNet的最终层，包含扩展功能：
-// 1. Compression：将backbone输出从32维压缩到8维
-// 2. Gate：融合前层适配特征 a_4 = (1-γ_4)·ẑ_4 + γ_4·â_3
-// 3. Expand：将8维扩展回32维（代替Adaptation）
-//
-// 数据流：
-// Backbone输出 z_4 [641×32] 
-//   → Compression Engine → Compressed Buffer ẑ_4 [641×8]
-//   → Gate Engine (融合â_3) → Gated Buffer a_4 [641×8]
-//   → Expand Engine → Final Output [641×32]
-//
-// 特殊性：
-// - 使用Expand代替Adaptation Transformer
-// - 输出维度恢复到32维
-// - 最终输出用于预测头
-//
-// Verilog标准：2001
-//================================================================================
-
 module sidenet_layer4 #(
     // ========== Token参数 ==========
-    parameter TOKEN_NUM       = 641,
+    parameter TOKEN_NUM       = 640,
     parameter TOKEN_BATCH     = 32,
-    parameter BATCH_NUM       = 21,
+    parameter BATCH_NUM       = 20,
     
     // ========== 维度参数 ==========
     parameter BACKBONE_DIM    = 32,        // Backbone输出维度
@@ -264,11 +241,11 @@ sidenet_compression_engine #(
     .busy(compress_busy),
     
     // Backbone读接口
-    .input_rd_en(backbone_rd_en),
-    .input_rd_addr(backbone_rd_addr),
-    .input_rd_exp(backbone_rd_exp),
-    .input_rd_mant(backbone_rd_mant),
-    .input_rd_valid(backbone_rd_valid),
+    .token_rd_en(backbone_rd_en),
+    .token_rd_addr(backbone_rd_addr),
+    .token_rd_exp(backbone_rd_exp),
+    .token_rd_mant(backbone_rd_mant),
+    .token_rd_valid(backbone_rd_valid),
     
     // 权重接口
     .weight_req(compress_weight_req),
@@ -344,10 +321,10 @@ sidenet_gate_engine #(
     .adapted_rd_valid(layer3_valid),
     
     // 输出到Gated Buffer
-    .result_wr_en(gate_buf_wr_en),
-    .result_wr_addr(gate_buf_wr_addr),
-    .result_wr_exp(gate_buf_wr_exp),
-    .result_wr_mant(gate_buf_wr_mant),
+    .gated_wr_en(gate_buf_wr_en),
+    .gated_wr_addr(gate_buf_wr_addr),
+    .gated_wr_exp(gate_buf_wr_exp),
+    .gated_wr_mant(gate_buf_wr_mant),
     
     // 调试
     .dbg_state(),

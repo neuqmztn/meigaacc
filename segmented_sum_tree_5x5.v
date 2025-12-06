@@ -1,78 +1,76 @@
 `timescale 1ns / 1ps
 
 //==============================================================
-// segmented_sum_tree_5x5.v - 分段求和树 (修复版)
-// 
-// 修改日志：
-// 1. 输入/输出位宽从 17-bit 扩展至 19-bit，适配顶层改动。
-// 2. 内部信号同步加宽。
+// segmented_sum_tree_5x5 - DSP 加速版求和树
+//
+// 说明：
+//   - 接口与原版 segmented_sum_tree_5x5 完全一致
+//   - 仍然是纯组合逻辑（不引入额外寄存器），不改变 MAC 的时序
+//   - 通过 (* use_dsp = "yes" *) 提示 Vivado 尽量使用 DSP48 做加法
+//   - skip_AB / skip_CD = 1 表示该组 PP 被判定为"可跳过"，在这里等效为加 0
 //==============================================================
-
 module segmented_sum_tree_5x5 (
-    // AB 组部分积输入 (19-bit)
     input  wire signed [18:0] pp_AB_0,
     input  wire signed [18:0] pp_AB_1,
     input  wire signed [18:0] pp_AB_2,
     input  wire signed [18:0] pp_AB_3,
     input  wire signed [18:0] pp_AB_4,
-    
-    // CD 组部分积输入 (19-bit)
+
     input  wire signed [18:0] pp_CD_0,
     input  wire signed [18:0] pp_CD_1,
     input  wire signed [18:0] pp_CD_2,
     input  wire signed [18:0] pp_CD_3,
     input  wire signed [18:0] pp_CD_4,
-    
-    // Skip 控制信号
-    input  wire [4:0] skip_AB,
-    input  wire [4:0] skip_CD,
-    
-    // 最终结果输出 (19-bit)
+
+    input  wire [4:0]        skip_AB,
+    input  wire [4:0]        skip_CD,
+
     output wire signed [18:0] result
 );
 
-    //--------------------------------------------------------------
-    // Stage 1: AB组内稀疏求和
-    //--------------------------------------------------------------
-    wire [2:0] ab_valid_count;
-    wire signed [18:0] ab_sum; // 修改为 19-bit
+    // ---------------------------------------------------------
+    // 1) 根据 skip 标志屏蔽对应的部分积（为 0 不参与求和）
+    // ---------------------------------------------------------
+    wire signed [18:0] ab0_eff = skip_AB[0] ? 19'sd0 : pp_AB_0;
+    wire signed [18:0] ab1_eff = skip_AB[1] ? 19'sd0 : pp_AB_1;
+    wire signed [18:0] ab2_eff = skip_AB[2] ? 19'sd0 : pp_AB_2;
+    wire signed [18:0] ab3_eff = skip_AB[3] ? 19'sd0 : pp_AB_3;
+    wire signed [18:0] ab4_eff = skip_AB[4] ? 19'sd0 : pp_AB_4;
 
-    sparse_sum_5to1 u_ab_sum (
-        .in0(pp_AB_0),
-        .in1(pp_AB_1),
-        .in2(pp_AB_2),
-        .in3(pp_AB_3),
-        .in4(pp_AB_4),
-        .skip(skip_AB),
-        .valid_count(ab_valid_count),
-        .sum(ab_sum)
-    );
+    wire signed [18:0] cd0_eff = skip_CD[0] ? 19'sd0 : pp_CD_0;
+    wire signed [18:0] cd1_eff = skip_CD[1] ? 19'sd0 : pp_CD_1;
+    wire signed [18:0] cd2_eff = skip_CD[2] ? 19'sd0 : pp_CD_2;
+    wire signed [18:0] cd3_eff = skip_CD[3] ? 19'sd0 : pp_CD_3;
+    wire signed [18:0] cd4_eff = skip_CD[4] ? 19'sd0 : pp_CD_4;
 
-    //--------------------------------------------------------------
-    // Stage 2: CD组内稀疏求和
-    //--------------------------------------------------------------
-    wire [2:0] cd_valid_count;
-    wire signed [18:0] cd_sum; // 修改为 19-bit
+    // ---------------------------------------------------------
+    // 2) 第一层：AB / CD 各自做本地求和
+    //    （每个加法器建议用 DSP 来实现）
+    // ---------------------------------------------------------
+    (* use_dsp = "yes" *) wire signed [18:0] ab_sum0 = ab0_eff + ab1_eff;
+    (* use_dsp = "yes" *) wire signed [18:0] ab_sum1 = ab2_eff + ab3_eff;
+    wire  signed [18:0] ab_sum2 = ab4_eff; // 单独一项，直接透传
 
-    sparse_sum_5to1 u_cd_sum (
-        .in0(pp_CD_0),
-        .in1(pp_CD_1),
-        .in2(pp_CD_2),
-        .in3(pp_CD_3),
-        .in4(pp_CD_4),
-        .skip(skip_CD),
-        .valid_count(cd_valid_count),
-        .sum(cd_sum)
-    );
+    (* use_dsp = "yes" *) wire signed [18:0] cd_sum0 = cd0_eff + cd1_eff;
+    (* use_dsp = "yes" *) wire signed [18:0] cd_sum1 = cd2_eff + cd3_eff;
+    wire  signed [18:0] cd_sum2 = cd4_eff;
 
-    //--------------------------------------------------------------
-    // Stage 3: 组间合并
-    //--------------------------------------------------------------
-    wire ab_all_zero = (ab_valid_count == 3'd0);
-    wire cd_all_zero = (cd_valid_count == 3'd0);
+    // ---------------------------------------------------------
+    // 3) 第二层：合并 AB / CD 局部和
+    // ---------------------------------------------------------
+    (* use_dsp = "yes" *) wire signed [18:0] sum_AB = ab_sum0 + ab_sum1; // AB 前 4 组
+    (* use_dsp = "yes" *) wire signed [18:0] sum_CD = cd_sum0 + cd_sum1; // CD 前 4 组
 
-    // 结果计算：即便 AB+CD，19-bit 也足够容纳最大值 (130,050 < 262,143)
-    assign result = ab_all_zero ? cd_sum :
-                    (cd_all_zero ? ab_sum : (ab_sum + cd_sum));
+    // 剩余两项（AB 第 5 组 + CD 第 5 组）
+    (* use_dsp = "yes" *) wire signed [18:0] sum_tail = ab_sum2 + cd_sum2;
+
+    // ---------------------------------------------------------
+    // 4) 最后一层：得到 10 组部分积的总和
+    //   （这个表达式里有两个"+"，工具会拆成两级加法，
+    //    也会尽量在 DSP 里实现）
+    // ---------------------------------------------------------
+    (* use_dsp = "yes" *) wire signed [18:0] result_tmp = sum_AB + sum_CD + sum_tail;
+
+    assign result = result_tmp;
 
 endmodule

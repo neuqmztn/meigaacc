@@ -1,28 +1,10 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// SideNet Layer 0 - 初始层模块（简化版）
-//
-// 功能：
-// Layer 0是SideNet的初始层，只执行压缩操作：
-// 1. Compression：将backbone输出从32维压缩到8维，直接输出
-//
-// 数据流：
-// Backbone输出 z_0 [641×32] 
-//   → Compression Engine → Layer Output Buffer â_0 [641×8]
-//
-// 特殊性：
-// - 最简化的处理，只有Compression
-// - 不需要Gate和Adaptation
-// - 为后续层提供初始压缩特征
-//
-//================================================================================
-
 module sidenet_layer0 #(
     // ========== Token参数 ==========
-    parameter TOKEN_NUM       = 641,
+    parameter TOKEN_NUM       = 640,
     parameter TOKEN_BATCH     = 32,
-    parameter BATCH_NUM       = 21,
+    parameter BATCH_NUM       = 20,
     
     // ========== 维度参数 ==========
     parameter BACKBONE_DIM    = 32,        // Backbone输出维度
@@ -175,11 +157,11 @@ sidenet_compression_engine #(
     .busy(compress_busy),
     
     // Backbone读接口
-    .input_rd_en(backbone_rd_en),
-    .input_rd_addr(backbone_rd_addr),
-    .input_rd_exp(backbone_rd_exp),
-    .input_rd_mant(backbone_rd_mant),
-    .input_rd_valid(backbone_rd_valid),
+    .token_rd_en(backbone_rd_en),
+    .token_rd_addr(backbone_rd_addr),
+    .token_rd_exp(backbone_rd_exp),
+    .token_rd_mant(backbone_rd_mant),
+    .token_rd_valid(backbone_rd_valid),
     
     // 权重接口
     .weight_req(compress_weight_req),

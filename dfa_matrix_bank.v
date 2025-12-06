@@ -1,35 +1,15 @@
 `timescale 1ns / 1ps
 
 //================================================================================
-// DFA Matrix Bank - B矩阵生成与存储 (二分类优化版)
-//
-// 版本：v1.1 (二分类优化)
-// 优化内容：
-// • NUM_CLASSES: 10 → 1 (二分类只需要1列)
-// • 存储空间减少82.5%: 640 → 112 elements
-// • 接口保持不变，完全兼容
-//
-// 功能说明：
-// 1. 使用LFSR生成固定随机矩阵B₀-B₄
-// 2. B矩阵值域：[-0.1, 0.1]，Q4.12定点格式
-// 3. 支持5个GCU并行读取
-//
+// DFA Matrix Bank - B矩阵生成与存储 (二分类优化版 - 已修复地址逻辑)
 // 存储映射：
 // • B₀-B₃: 8×1 = 8 elements each
 // • B₄: 32×1 = 32 elements
-// • 总计：112 elements (vs 原640 elements)
+// • 总计：112 elements
 //
-// 矩阵规格（二分类优化）：
-// • B₀: [8×1]  = 8 elements
-// • B₁: [8×1]  = 8 elements  
-// • B₂: [8×1]  = 8 elements
-// • B₃: [8×1]  = 8 elements
-// • B₄: [32×1] = 32 elements
-// 总计：112 elements（vs 原640 elements，节省82.5%）
-//
-// 作者：MEIGA Team
-// 日期：2025-11-19
-// 版本：v1.1 (二分类优化)
+// 修正说明：
+// 1. 读取逻辑修改为直接映射行地址 (Row Address -> Mem Address)
+// 2. 初始化写入计数器限制修正为实际深度 (80->8, 320->32)
 //================================================================================
 
 module dfa_matrix_bank #(
@@ -48,70 +28,70 @@ module dfa_matrix_bank #(
     //==========================================================================
     // 初始化控制接口
     //==========================================================================
-    input  wire        init_start,          // 开始初始化
-    output reg         init_done,           // 初始化完成
-    output reg         matrices_exist,      // 矩阵已存在标志
+    input  wire         init_start,       // 开始初始化
+    output reg          init_done,        // 初始化完成
+    output reg          matrices_exist,   // 矩阵已存在标志
     
     //==========================================================================
     // GCU 0 读接口 (Layer 0)
     //==========================================================================
-    input  wire        gcu0_rd_en,
-    input  wire [2:0]  gcu0_row_addr,       // 0-7
-    input  wire [3:0]  gcu0_col_addr,       // 0-9
+    input  wire         gcu0_rd_en,
+    input  wire [2:0]   gcu0_row_addr,    // 0-7
+    input  wire [3:0]   gcu0_col_addr,    // 0-9 (二分类模式下忽略此输入)
     output reg  [DATA_WIDTH-1:0] gcu0_data,
-    output reg         gcu0_valid,
+    output reg          gcu0_valid,
     
     //==========================================================================
     // GCU 1 读接口 (Layer 1)
     //==========================================================================
-    input  wire        gcu1_rd_en,
-    input  wire [2:0]  gcu1_row_addr,
-    input  wire [3:0]  gcu1_col_addr,
+    input  wire         gcu1_rd_en,
+    input  wire [2:0]   gcu1_row_addr,
+    input  wire [3:0]   gcu1_col_addr,
     output reg  [DATA_WIDTH-1:0] gcu1_data,
-    output reg         gcu1_valid,
+    output reg          gcu1_valid,
     
     //==========================================================================
     // GCU 2 读接口 (Layer 2)
     //==========================================================================
-    input  wire        gcu2_rd_en,
-    input  wire [2:0]  gcu2_row_addr,
-    input  wire [3:0]  gcu2_col_addr,
+    input  wire         gcu2_rd_en,
+    input  wire [2:0]   gcu2_row_addr,
+    input  wire [3:0]   gcu2_col_addr,
     output reg  [DATA_WIDTH-1:0] gcu2_data,
-    output reg         gcu2_valid,
+    output reg          gcu2_valid,
     
     //==========================================================================
     // GCU 3 读接口 (Layer 3)
     //==========================================================================
-    input  wire        gcu3_rd_en,
-    input  wire [2:0]  gcu3_row_addr,
-    input  wire [3:0]  gcu3_col_addr,
+    input  wire         gcu3_rd_en,
+    input  wire [2:0]   gcu3_row_addr,
+    input  wire [3:0]   gcu3_col_addr,
     output reg  [DATA_WIDTH-1:0] gcu3_data,
-    output reg         gcu3_valid,
+    output reg          gcu3_valid,
     
     //==========================================================================
     // GCU 4 读接口 (Layer 4)
     //==========================================================================
-    input  wire        gcu4_rd_en,
-    input  wire [4:0]  gcu4_row_addr,       // 0-31
-    input  wire [3:0]  gcu4_col_addr,       // 0-9
+    input  wire         gcu4_rd_en,
+    input  wire [4:0]   gcu4_row_addr,    // 0-31
+    input  wire [3:0]   gcu4_col_addr,    // 0-9
     output reg  [DATA_WIDTH-1:0] gcu4_data,
-    output reg         gcu4_valid,
+    output reg          gcu4_valid,
     
     //==========================================================================
     // Delta Calculator 读接口
     //==========================================================================
-    input  wire        delta_rd_en,
-    input  wire [2:0]  delta_layer_id,      // 层ID (0-4)
-    input  wire [4:0]  delta_row_addr,      // 行地址 (0-31)
-    input  wire [3:0]  delta_col_addr,      // 列地址 (0-9)
+    input  wire         delta_rd_en,
+    input  wire [2:0]   delta_layer_id,   // 层ID (0-4)
+    input  wire [4:0]   delta_row_addr,   // 行地址 (0-31)
+    input  wire [3:0]   delta_col_addr,   // 列地址 (0-9)
     output reg  [DATA_WIDTH-1:0] delta_data,
-    output reg         delta_valid,
+    output reg          delta_valid,
     
     //==========================================================================
     // 调试接口
     //==========================================================================
-    output wire [3:0]  init_state,          // 初始化状态
-    output wire [31:0] init_counter         // 初始化计数器
+    output wire [3:0]   init_state,       // 初始化状态
+    output wire [31:0]  init_counter      // 初始化计数器
 );
 
 //================================================================================
@@ -266,31 +246,32 @@ always @(*) begin
 end
 
 // 存储器写入逻辑
+// 修正：循环次数从80/320改为8/32，匹配N x 1结构
 always @(posedge clk) begin
     case (init_state_reg)
         INIT_B0: begin
-            if (init_cnt_reg < 9'd80) begin
-                b0_mem[init_cnt_reg[6:0]] <= b_element;
+            if (init_cnt_reg < 9'd8) begin
+                b0_mem[init_cnt_reg[2:0]] <= b_element;
             end
         end
         INIT_B1: begin
-            if (init_cnt_reg < 9'd80) begin
-                b1_mem[init_cnt_reg[6:0]] <= b_element;
+            if (init_cnt_reg < 9'd8) begin
+                b1_mem[init_cnt_reg[2:0]] <= b_element;
             end
         end
         INIT_B2: begin
-            if (init_cnt_reg < 9'd80) begin
-                b2_mem[init_cnt_reg[6:0]] <= b_element;
+            if (init_cnt_reg < 9'd8) begin
+                b2_mem[init_cnt_reg[2:0]] <= b_element;
             end
         end
         INIT_B3: begin
-            if (init_cnt_reg < 9'd80) begin
-                b3_mem[init_cnt_reg[6:0]] <= b_element;
+            if (init_cnt_reg < 9'd8) begin
+                b3_mem[init_cnt_reg[2:0]] <= b_element;
             end
         end
         INIT_B4: begin
-            if (init_cnt_reg < 9'd320) begin
-                b4_mem[init_cnt_reg[8:0]] <= b_element;
+            if (init_cnt_reg < 9'd32) begin
+                b4_mem[init_cnt_reg[4:0]] <= b_element;
             end
         end
     endcase
@@ -299,20 +280,14 @@ end
 //================================================================================
 // 读取逻辑 - 5个并行端口
 //================================================================================
-// 地址计算：addr = row * NUM_CLASSES + col
-wire [6:0] gcu0_addr = {gcu0_row_addr, gcu0_col_addr[3:0]};  // row*8 + col (近似)
-wire [6:0] gcu1_addr = {gcu1_row_addr, gcu1_col_addr[3:0]};
-wire [6:0] gcu2_addr = {gcu2_row_addr, gcu2_col_addr[3:0]};
-wire [6:0] gcu3_addr = {gcu3_row_addr, gcu3_col_addr[3:0]};
-wire [8:0] gcu4_addr = {gcu4_row_addr, gcu4_col_addr};
+// 修正：二分类(Nx1)模式下，内存索引直接等于行地址(Row Address)，忽略列地址
+// 地址计算：addr = row (因为 col 恒为 0)
 
-// 更精确的地址计算：row * 10 + col
-// 使用移位和加法：row * 10 = row * 8 + row * 2 = (row << 3) + (row << 1)
-wire [6:0] gcu0_addr_precise = ({4'b0000, gcu0_row_addr} << 3) + ({5'b00000, gcu0_row_addr} << 1) + {3'b000, gcu0_col_addr};
-wire [6:0] gcu1_addr_precise = ({4'b0000, gcu1_row_addr} << 3) + ({5'b00000, gcu1_row_addr} << 1) + {3'b000, gcu1_col_addr};
-wire [6:0] gcu2_addr_precise = ({4'b0000, gcu2_row_addr} << 3) + ({5'b00000, gcu2_row_addr} << 1) + {3'b000, gcu2_col_addr};
-wire [6:0] gcu3_addr_precise = ({4'b0000, gcu3_row_addr} << 3) + ({5'b00000, gcu3_row_addr} << 1) + {3'b000, gcu3_col_addr};
-wire [8:0] gcu4_addr_precise = ({4'b0000, gcu4_row_addr} << 3) + ({6'b000000, gcu4_row_addr} << 1) + {5'b00000, gcu4_col_addr};
+wire [2:0] gcu0_addr_opt = gcu0_row_addr;
+wire [2:0] gcu1_addr_opt = gcu1_row_addr;
+wire [2:0] gcu2_addr_opt = gcu2_row_addr;
+wire [2:0] gcu3_addr_opt = gcu3_row_addr;
+wire [4:0] gcu4_addr_opt = gcu4_row_addr;
 
 // GCU 0读取（B0）
 always @(posedge clk or negedge rst_n) begin
@@ -320,7 +295,7 @@ always @(posedge clk or negedge rst_n) begin
         gcu0_data <= 16'd0;
         gcu0_valid <= 1'b0;
     end else if (gcu0_rd_en && matrices_exist) begin
-        gcu0_data <= b0_mem[gcu0_addr_precise];
+        gcu0_data <= b0_mem[gcu0_addr_opt];
         gcu0_valid <= 1'b1;
     end else begin
         gcu0_valid <= 1'b0;
@@ -333,7 +308,7 @@ always @(posedge clk or negedge rst_n) begin
         gcu1_data <= 16'd0;
         gcu1_valid <= 1'b0;
     end else if (gcu1_rd_en && matrices_exist) begin
-        gcu1_data <= b1_mem[gcu1_addr_precise];
+        gcu1_data <= b1_mem[gcu1_addr_opt];
         gcu1_valid <= 1'b1;
     end else begin
         gcu1_valid <= 1'b0;
@@ -346,7 +321,7 @@ always @(posedge clk or negedge rst_n) begin
         gcu2_data <= 16'd0;
         gcu2_valid <= 1'b0;
     end else if (gcu2_rd_en && matrices_exist) begin
-        gcu2_data <= b2_mem[gcu2_addr_precise];
+        gcu2_data <= b2_mem[gcu2_addr_opt];
         gcu2_valid <= 1'b1;
     end else begin
         gcu2_valid <= 1'b0;
@@ -359,7 +334,7 @@ always @(posedge clk or negedge rst_n) begin
         gcu3_data <= 16'd0;
         gcu3_valid <= 1'b0;
     end else if (gcu3_rd_en && matrices_exist) begin
-        gcu3_data <= b3_mem[gcu3_addr_precise];
+        gcu3_data <= b3_mem[gcu3_addr_opt];
         gcu3_valid <= 1'b1;
     end else begin
         gcu3_valid <= 1'b0;
@@ -372,7 +347,7 @@ always @(posedge clk or negedge rst_n) begin
         gcu4_data <= 16'd0;
         gcu4_valid <= 1'b0;
     end else if (gcu4_rd_en && matrices_exist) begin
-        gcu4_data <= b4_mem[gcu4_addr_precise];
+        gcu4_data <= b4_mem[gcu4_addr_opt];
         gcu4_valid <= 1'b1;
     end else begin
         gcu4_valid <= 1'b0;
@@ -382,10 +357,8 @@ end
 //================================================================================
 // Delta Calculator 读取逻辑
 //================================================================================
-// Delta地址计算：row * 10 + col
-wire [8:0] delta_addr_precise = ({4'b0000, delta_row_addr} << 3) + 
-                                 ({6'b000000, delta_row_addr} << 1) + 
-                                 {5'b00000, delta_col_addr};
+// 修正：Delta读取也改为直接映射行地址
+wire [4:0] delta_addr_opt = delta_row_addr;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -394,24 +367,24 @@ always @(posedge clk or negedge rst_n) begin
     end else if (delta_rd_en && matrices_exist) begin
         case (delta_layer_id)
             3'd0: begin
-                // B0矩阵
-                delta_data <= b0_mem[delta_addr_precise[6:0]];
+                // B0矩阵 (取低3位地址)
+                delta_data <= b0_mem[delta_addr_opt[2:0]];
             end
             3'd1: begin
                 // B1矩阵
-                delta_data <= b1_mem[delta_addr_precise[6:0]];
+                delta_data <= b1_mem[delta_addr_opt[2:0]];
             end
             3'd2: begin
                 // B2矩阵
-                delta_data <= b2_mem[delta_addr_precise[6:0]];
+                delta_data <= b2_mem[delta_addr_opt[2:0]];
             end
             3'd3: begin
                 // B3矩阵
-                delta_data <= b3_mem[delta_addr_precise[6:0]];
+                delta_data <= b3_mem[delta_addr_opt[2:0]];
             end
             3'd4: begin
-                // B4矩阵
-                delta_data <= b4_mem[delta_addr_precise];
+                // B4矩阵 (32深，使用完整5位地址)
+                delta_data <= b4_mem[delta_addr_opt];
             end
             default: begin
                 delta_data <= 16'd0;

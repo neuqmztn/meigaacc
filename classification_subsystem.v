@@ -100,7 +100,7 @@ classification_weight_storage #(
     
     // 读接口（推理和训练都用）
     .rd_addr(weight_rd_addr),
-    .weight_data(weight_data),
+    .rd_data(weight_data),
     .bias(bias),
     
     // 加载接口（初始化用）
