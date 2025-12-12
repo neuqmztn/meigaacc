@@ -1,29 +1,5 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Multi-Head BFP Converter
-// 
-// 功能：为多头Attention设计的BFP转换器
-// - 每个头独立计算共享指数
-// - 适用于QKV计算引擎
-// 
-// 使用场景：
-// - QKV计算：4个头 × 8个元素 = 32个结果
-// - 输出：4个独立的共享指数（每头一个）
-//
-// 输入：CE的定点输出
-// - input_fixed_array:   定点数
-// - input_base_exp_array: 基础指数（9位）
-// - input_zero_array:    零标志
-//
-// 输出：每头独立共享指数的BFP格式
-// - output_mant_array:     对齐后的尾数
-// - output_shared_exps:    每头的共享指数
-// - output_overflow:       每头的溢出标志
-//
-// 版本：v1.0
-//================================================================================
-
 module multi_head_bfp_converter #(
     parameter NUM_HEADS = 4,              // 头数
     parameter RESULTS_PER_HEAD = 8,       // 每头的结果数
@@ -58,23 +34,6 @@ module multi_head_bfp_converter #(
 //==============================================================================
 
 localparam TOTAL_RESULTS = NUM_HEADS * RESULTS_PER_HEAD;
-
-initial begin
-    $display("========================================");
-    $display("Multi-Head BFP Converter");
-    $display("========================================");
-    $display("Configuration:");
-    $display("  Number of Heads: %0d", NUM_HEADS);
-    $display("  Results per Head: %0d", RESULTS_PER_HEAD);
-    $display("  Total Results: %0d", TOTAL_RESULTS);
-    $display("  Input: %0d-bit fixed + %0d-bit base_exp", FIXED_WIDTH, BASE_EXP_WIDTH);
-    $display("  Output: %0d-bit mant + %0d independent shared exps", OUTPUT_MANT_WIDTH, NUM_HEADS);
-    $display("========================================");
-end
-
-//==============================================================================
-// 为每个头实例化独立的BFP转换器
-//==============================================================================
 
 genvar h;
 generate
@@ -135,24 +94,6 @@ generate
     end
 endgenerate
 
-//==============================================================================
-// 调试信息（仿真时显示转换结果）
-//==============================================================================
 
-`ifdef SIMULATION
-integer head_idx;
-
-always @(posedge clk) begin
-    if (|input_valids) begin
-        $display("[Multi-Head BFP] Time=%0t", $time);
-        for (head_idx = 0; head_idx < NUM_HEADS; head_idx = head_idx + 1) begin
-            $display("  Head %0d: shared_exp=%0d, overflow=%0b", 
-                     head_idx,
-                     output_shared_exps[(head_idx+1)*OUTPUT_EXP_WIDTH-1 : head_idx*OUTPUT_EXP_WIDTH],
-                     output_overflow[head_idx]);
-        end
-    end
-end
-`endif
 
 endmodule

@@ -1,29 +1,5 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Sidenet Weight Controller v3.2 - 添加FFN权重接口
-// 
-// 功能:
-// 1. 从Storage批量读取权重 (burst传输)
-// 2. 缓存和重组权重数据
-// 3. 为各层提供完整的权重矩阵
-// 4. 支持DFA训练时的权重写回
-//
-// 主要变更 (v3.2):
-// - 新增FFN W1和W2权重接口
-// - W1: 8×32矩阵，32个列指数，32 bursts
-// - W2: 32×8矩阵，8个列指数，16 bursts
-//
-// 主要变更 (v3.1):
-// - 新增独立的WO权重输出接口
-// - WO权重使用独立缓存和输出端口
-// - QKV权重仍使用原有接口
-//
-// 作者: MEIGA Team  
-// 日期: 2025-11-16
-// 版本: v3.2
-//================================================================================
-
 module sidenet_weight_controller #(
     parameter NUM_LAYERS       = 5,
     parameter BACKBONE_DIM     = 32,
@@ -491,19 +467,6 @@ always @(posedge clk or negedge rst_n) begin
     end
 end
 
-//================================================================================
-// 数据重组逻辑 - Compression
-//
-// 从burst buffer重组为计算引擎格式
-// Burst组织: 列优先，每列占2个burst
-//   Burst 0-1:   列0 (32个权重)
-//   Burst 2-3:   列1
-//   ...
-//   Burst 14-15: 列7
-//
-// 目标格式: [列][行] = compress_weight_mant[col*32*16 + row*16 +: 16]
-//================================================================================
-
 integer asm_col, asm_row;
 
 always @(posedge clk) begin
@@ -533,20 +496,6 @@ always @(posedge clk) begin
     end
 end
 
-//================================================================================
-// 数据重组逻辑 - Attention (QKV Only)
-//
-// Burst组织: 每列占1个burst
-//   Burst 0: 列0 (8个权重)
-//   Burst 1: 列1
-//   ...
-//   Burst 7: 列7
-//
-// 目标格式: [列][行] = attention_weight_mant[col*8*16 + row*16 +: 16]
-//
-// 修改 v3.1: 只处理WQ/WK/WV，WO使用独立逻辑
-//================================================================================
-
 always @(posedge clk) begin
     if (state == ASSEMBLE && (serving_weight_type >= WEIGHT_ATT_WQ && serving_weight_type <= WEIGHT_ATT_WV)) begin
         // 提取指数 (8个)
@@ -565,18 +514,6 @@ always @(posedge clk) begin
         end
     end
 end
-
-//================================================================================
-// 数据重组逻辑 - WO (新增 v3.1)
-//
-// Burst组织: 每列占1个burst (同Attention)
-//   Burst 0: 列0 (8个权重)
-//   Burst 1: 列1
-//   ...
-//   Burst 7: 列7
-//
-// 目标格式: [列][行] = wo_weight_mant[col*8*16 + row*16 +: 16]
-//================================================================================
 
 always @(posedge clk) begin
     if (state == ASSEMBLE && serving_weight_type == WEIGHT_ATT_WO) begin
@@ -597,19 +534,6 @@ always @(posedge clk) begin
     end
 end
 
-//================================================================================
-// 数据重组逻辑 - FFN W1 (新增 v3.2)
-//
-// Burst组织: 每列占1个burst
-//   Burst 0:  列0 (8个权重)
-//   Burst 1:  列1
-//   ...
-//   Burst 31: 列31
-//
-// 目标格式: [列][行] = ffn_w1_weight_mant[col*8*16 + row*16 +: 16]
-// 矩阵: 8×32 (8行32列)
-//================================================================================
-
 always @(posedge clk) begin
     if (state == ASSEMBLE && serving_weight_type == WEIGHT_FFN_W1) begin
         // 提取指数 (32个)
@@ -628,19 +552,6 @@ always @(posedge clk) begin
         end
     end
 end
-
-//================================================================================
-// 数据重组逻辑 - FFN W2 (新增 v3.2)
-//
-// Burst组织: 列优先，每列占2个burst
-//   Burst 0-1:   列0 (32个权重)
-//   Burst 2-3:   列1
-//   ...
-//   Burst 14-15: 列7
-//
-// 目标格式: [列][行] = ffn_w2_weight_mant[col*32*16 + row*16 +: 16]
-// 矩阵: 32×8 (32行8列)
-//================================================================================
 
 always @(posedge clk) begin
     if (state == ASSEMBLE && serving_weight_type == WEIGHT_FFN_W2) begin
@@ -666,18 +577,6 @@ always @(posedge clk) begin
         end
     end
 end
-
-//================================================================================
-// 数据重组逻辑 - Expand
-//
-// Burst组织: 每列占1个burst
-//   Burst 0:  列0 (8个权重)
-//   Burst 1:  列1
-//   ...
-//   Burst 31: 列31
-//
-// 目标格式: [列][行] = expand_weight_mant[col*8*16 + row*16 +: 16]
-//================================================================================
 
 always @(posedge clk) begin
     if (state == ASSEMBLE && serving_weight_type == WEIGHT_EXPAND) begin

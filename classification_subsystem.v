@@ -1,31 +1,8 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Classification Subsystem - 分类与误差计算子系统
-//
-// 功能说明：
-// 封装二分类相关的所有模块：
-// 1. Classification Weight Storage - 分类头权重（固定权重）
-// 2. Classification Error Module - BCE误差计算
-//
-// 设计理念：
-// • 独立的分类子系统，与DFA训练分离
-// • 推理和训练都使用同一套分类逻辑
-// • 清晰的接口，易于复用
-//
-// 数据流：
-// CLS Token → Classification Head → Sigmoid → Probability
-//                                            ↓ (训练模式)
-//                                          Error = prob - label
-//
-// 作者：MEIGA Team
-// 日期：2025-11-19
-// 版本：v1.0
-//================================================================================
-
 module classification_subsystem #(
-    parameter DIM = 32,              // CLS token维度
-    parameter DATA_WIDTH = 16        // Q4.12格式
+    parameter DIM = 32,              
+    parameter DATA_WIDTH = 16      
 )(
     //==========================================================================
     // 时钟和复位
@@ -36,7 +13,7 @@ module classification_subsystem #(
     //==========================================================================
     // 控制接口
     //==========================================================================
-    input  wire start,               // 开始计算（脉冲）
+    input  wire start,             
     input  wire train_mode,          // 1=训练模式，0=推理模式
     output wire done,                // 计算完成
     output wire busy,                // 计算中
@@ -100,7 +77,7 @@ classification_weight_storage #(
     
     // 读接口（推理和训练都用）
     .rd_addr(weight_rd_addr),
-    .weight_data(weight_data),
+    .rd_data(weight_data),
     .bias(bias),
     
     // 加载接口（初始化用）

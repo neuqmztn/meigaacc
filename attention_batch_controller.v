@@ -1,5 +1,5 @@
 module attention_batch_controller #(
-    parameter NUM_BATCHES = 21,
+    parameter NUM_BATCHES = 20,
     parameter NUM_HEADS   = 4,
     parameter TOKEN_BATCH = 32
 )(
@@ -40,7 +40,7 @@ module attention_batch_controller #(
     //===========================================================================
     // 状态输出
     //===========================================================================
-    output reg  [4:0] current_batch,
+    output reg  [6:0] current_batch,
     output reg  first_batch_flag,
     
     //===========================================================================

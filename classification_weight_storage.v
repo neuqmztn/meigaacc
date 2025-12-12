@@ -1,63 +1,33 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Classification Weight Storage - 分类头权重存储
-//
-// 功能说明：
-// 存储分类头的权重和偏置
-// 
-// 存储内容：
-//   • 权重W: [DIM × 1] = 32个权重值（Q4.12格式）
-//   • 偏置b: 1个偏置值（Q4.12格式）
-//
-// 接口：
-//   • 读接口：用于前向传播（分类计算）
-//   • 写接口：用于训练更新
-//   • 初始化接口：可选的初始化功能
-//
-// 性能：
-//   • 读延迟：0 cycle（组合逻辑）
-//   • 写延迟：1 cycle
-//
-// 作者：MEIGA Team
-// 日期：2025-11-19
-// 版本：v1.0
-//================================================================================
-
 module classification_weight_storage #(
-    parameter DIM = 32,              // 特征维度
-    parameter DATA_WIDTH = 16,       // Q4.12格式
-    parameter DIM_ADDR_WIDTH = 5     // log2(32) = 5
+    parameter DIM = 32,              
+    parameter DATA_WIDTH = 16,      
+    parameter DIM_ADDR_WIDTH = 5     
 )(
     //==========================================================================
     // 时钟和复位
     //==========================================================================
     input  wire clk,
-    input  wire rst_n,
+    input  wire rst_n,              
     
     //==========================================================================
     // 初始化接口（配置初始权重）
     //==========================================================================
-    input  wire        init_en,              // 初始化使能
-    input  wire [DIM_ADDR_WIDTH-1:0] init_addr,    // 初始化地址（0-31）
-    input  wire [DATA_WIDTH-1:0] init_data,  // 初始化权重值
+    input  wire        init_en,              
+    input  wire [DIM_ADDR_WIDTH-1:0] init_addr,   
+    input  wire [DATA_WIDTH-1:0] init_data,  
     
     // 偏置初始化
-    input  wire        init_bias_en,         // 偏置初始化使能
-    input  wire [DATA_WIDTH-1:0] init_bias,  // 偏置初始值
+    input  wire        init_bias_en,         
+    input  wire [DATA_WIDTH-1:0] init_bias, 
     
     //==========================================================================
     // 读接口（只读，用于前向传播）
     //==========================================================================
     input  wire [DIM_ADDR_WIDTH-1:0] rd_addr,    // 读地址（0-31）
-    output wire [DATA_WIDTH-1:0] rd_data,         // 权重W[addr]
-    output wire [DATA_WIDTH-1:0] bias,            // 偏置b
-    
-    //==========================================================================
-    // 调试接口
-    //==========================================================================
-    output reg  [31:0] dbg_init_count,       // 初始化计数
-    output reg  [31:0] dbg_read_count        // 读计数
+    output wire [DATA_WIDTH-1:0] rd_data,        // 权重W[addr]
+    output wire [DATA_WIDTH-1:0] bias
 );
 
 //================================================================================
@@ -67,26 +37,12 @@ reg [DATA_WIDTH-1:0] weights [0:DIM-1];
 reg [DATA_WIDTH-1:0] bias_reg;
 
 //================================================================================
-// 初始化逻辑
+// 初始化逻辑 (无依靠写入覆盖)
 //================================================================================
-integer i;
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        // 复位：全部清零
-        for (i = 0; i < DIM; i = i + 1) begin
-            weights[i] <= 16'sd0;
-        end
-        bias_reg <= 16'sd0;
-        dbg_init_count <= 32'd0;
-    end else begin
-        // 初始化权重（逐个配置）
-        if (init_en) begin
-            weights[init_addr] <= init_data;
-            dbg_init_count <= dbg_init_count + 1;
-        end
-        
-        // 初始化偏置
-        if (init_bias_en) begin
+always @(posedge clk) begin  
+    if (init_en) begin
+        weights[init_addr] <= init_data;
+        if (init_bias_en && (init_addr == 5'd0)) begin
             bias_reg <= init_bias;
         end
     end
@@ -98,19 +54,6 @@ end
 assign rd_data = weights[rd_addr];
 assign bias = bias_reg;
 
-//================================================================================
-// 调试计数器
-//================================================================================
-
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        dbg_read_count <= 32'd0;
-    end else begin
-        // 统计读操作（每个时钟周期可能有读取）
-        dbg_read_count <= dbg_read_count + 1;
-    end
-end
 
 
 endmodule

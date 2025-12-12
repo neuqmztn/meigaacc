@@ -1,37 +1,19 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// SideNet Layer 0 - 初始层模块（简化版）
-//
-// 功能：
-// Layer 0是SideNet的初始层，只执行压缩操作：
-// 1. Compression：将backbone输出从32维压缩到8维，直接输出
-//
-// 数据流：
-// Backbone输出 z_0 [641×32] 
-//   → Compression Engine → Layer Output Buffer â_0 [641×8]
-//
-// 特殊性：
-// - 最简化的处理，只有Compression
-// - 不需要Gate和Adaptation
-// - 为后续层提供初始压缩特征
-//
-//================================================================================
-
 module sidenet_layer0 #(
     // ========== Token参数 ==========
-    parameter TOKEN_NUM       = 641,
+    parameter TOKEN_NUM       = 640,
     parameter TOKEN_BATCH     = 32,
-    parameter BATCH_NUM       = 21,
+    parameter BATCH_NUM       = 20,
     
     // ========== 维度参数 ==========
-    parameter BACKBONE_DIM    = 32,        // Backbone输出维度
-    parameter SIDENET_DIM     = 8,         // SideNet压缩维度
+    parameter BACKBONE_DIM    = 32,        
+    parameter SIDENET_DIM     = 8,        
     
     // ========== 数据格式参数 ==========
-    parameter DATA_WIDTH      = 16,        // BFP尾数位宽
-    parameter EXP_WIDTH       = 8,         // BFP指数位宽
-    parameter ADDR_WIDTH      = 10         // 地址位宽
+    parameter DATA_WIDTH      = 16,        
+    parameter EXP_WIDTH       = 8,         
+    parameter ADDR_WIDTH      = 10      
 )(
     input  wire clk,
     input  wire rst_n,
@@ -39,14 +21,13 @@ module sidenet_layer0 #(
     //================================================================================
     // 控制接口
     //================================================================================
-    input  wire start,                     // 启动信号
-    output wire done,                      // 完成信号
-    output wire busy,                      // 忙碌标志
-    output reg  error,                     // 错误标志
+    input  wire start,                     
+    output wire done,                    
+    output wire busy,                     
+    output reg  error,                    
     
     //================================================================================
     // Backbone输出读取接口（从Layer Token Buffer）
-    // 读取 z_0 [641×32]
     //================================================================================
     output wire backbone_rd_en,
     output wire [ADDR_WIDTH-1:0] backbone_rd_addr,
@@ -64,7 +45,6 @@ module sidenet_layer0 #(
     
     //================================================================================
     // 权重接口（只需要Compression权重）
-    // ✅ 修改：支持每列独立共享指数（8个指数）
     //================================================================================
     output wire compress_weight_req,
     input  wire compress_weight_ready,
@@ -79,7 +59,7 @@ module sidenet_layer0 #(
 );
 
 //================================================================================
-// 状态机定义（简化版）
+// 状态机定义
 //================================================================================
 
 localparam IDLE        = 4'd0;
@@ -154,10 +134,9 @@ assign busy = (state_reg != IDLE) && (state_reg != DONE_STATE);
 assign dbg_state = state_reg;
 
 //================================================================================
-// 模块实例化（只需要Compression Engine）
+// 模块实例化
 //================================================================================
 
-// Compression Engine - 直接输出到Layer Output Buffer
 sidenet_compression_engine #(
     .TOKEN_NUM(TOKEN_NUM),
     .TOKEN_BATCH(TOKEN_BATCH),
@@ -175,11 +154,11 @@ sidenet_compression_engine #(
     .busy(compress_busy),
     
     // Backbone读接口
-    .input_rd_en(backbone_rd_en),
-    .input_rd_addr(backbone_rd_addr),
-    .input_rd_exp(backbone_rd_exp),
-    .input_rd_mant(backbone_rd_mant),
-    .input_rd_valid(backbone_rd_valid),
+    .token_rd_en(backbone_rd_en),
+    .token_rd_addr(backbone_rd_addr),
+    .token_rd_exp(backbone_rd_exp),
+    .token_rd_mant(backbone_rd_mant),
+    .token_rd_valid(backbone_rd_valid),
     
     // 权重接口
     .weight_req(compress_weight_req),

@@ -1,49 +1,10 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// SideNet Layer Standard v2.1 - 标准层集成模块（Layer 1-3复用）
-//
-// 主要变更 (v2.1):
-// - 删除FFN DRAM接口
-// - 新增FFN权重接口（W1和W2）
-// - FFN权重通过weight_controller统一管理
-//
-// 主要变更 (v2.0):
-// - 删除KV Cache接口（内部封装在Attention模块中）
-// - 删除LN1暂存接口（内部封装在Transformer模块中）
-// - 修改Attention权重接口为数组格式（8个指数）
-// - 新增独立的WO权重接口
-// - 更新LayerNorm参数接口（ln_param_type编码）
-//
-// 功能：
-// 实现SideNet标准层（Layer 1-3）的完整处理流程：
-// Compression → Gate → Adaptation Transformer
-//
-// 数据流：
-// Backbone输出 z_(i-1) [641×32] 
-//   → Compression Engine → Compressed Buffer ẑ_i [641×8]
-//   → Gate Engine (融合 â_(i-1)) → Gated Buffer a_i [641×8]
-//   → Adaptation Transformer → Layer Output Buffer â_i [641×8]
-//
-// 时分复用：
-// 本模块单个实例可被Layer 1、2、3复用，通过layer_id参数区分
-//
-// 架构特点：
-// - 三阶段流水线：Compression → Gate → Adaptation
-// - 内部临时Buffer：Compressed Buffer、Gated Buffer（单BANK复用）
-// - 外部持久存储：Layer Output Buffer（4-BANK独立）
-// - FSM控制：协调各阶段执行顺序
-//
-// 作者: MEIGA Team
-// 日期: 2025-11-16
-// 版本: v2.1
-//================================================================================
-
 module sidenet_layer_standard #(
     // ========== Token参数 ==========
-    parameter TOKEN_NUM       = 641,
+    parameter TOKEN_NUM       = 640,
     parameter TOKEN_BATCH     = 32,
-    parameter BATCH_NUM       = 21,
+    parameter BATCH_NUM       = 20,
     
     // ========== 维度参数 ==========
     parameter BACKBONE_DIM    = 32,        // Backbone输出维度
@@ -60,7 +21,7 @@ module sidenet_layer_standard #(
     
     // ========== Attention参数 ==========
     parameter K_CHUNK_SIZE    = 32,
-    parameter K_CHUNK_NUM     = 21,
+    parameter K_CHUNK_NUM     = 20,
     
     // ========== 层参数 ==========
     parameter NUM_LAYERS      = 4          // SideNet总层数
@@ -137,7 +98,7 @@ module sidenet_layer_standard #(
     input  wire [SIDENET_DIM*SIDENET_DIM*DATA_WIDTH-1:0] wo_weight_mant,
     
     //================================================================================
-    // FFN权重接口（新增 v2.1 - 替代DRAM）
+    // FFN权重接口（新增 v2.1 - 通过weight_controller提供 W1/W2 完整矩阵）
     //================================================================================
     // Linear1权重接口
     output wire ffn_w1_weight_req,
@@ -198,7 +159,6 @@ wire compress_start, compress_done, compress_busy;
 // Gate Engine
 wire gate_start, gate_done, gate_busy;
 wire is_layer0;  // Layer 0标志（本模块不处理Layer 0，但保留接口）
-
 // Adaptation Transformer
 wire transformer_start, transformer_done, transformer_busy;
 
@@ -229,6 +189,110 @@ wire [ADDR_WIDTH-1:0] gated_rd_addr;
 wire [EXP_WIDTH-1:0] gated_rd_exp;
 wire [SIDENET_DIM*DATA_WIDTH-1:0] gated_rd_mant;
 wire gated_rd_valid;
+
+//================================================================================
+// FFN 权重适配器：将 weight_controller 提供的 W1/W2 完整矩阵
+// 转换为 FFN 内核需要的按 chunk 的权重块接口
+//================================================================================
+
+// 传给 Adaptation Transformer / FFN 的统一权重接口
+wire                        ffn_weight_req;
+wire [1:0]                  ffn_weight_type;       // 00=W1, 01=W2
+wire [1:0]                  ffn_weight_chunk_id;   // 0~3, 每块 FEATURE_CHUNK 列
+wire                        ffn_weight_ready;
+wire [SIDENET_DIM*EXP_WIDTH-1:0]           ffn_weight_exp_array;
+wire [SIDENET_DIM*FEATURE_CHUNK*DATA_WIDTH-1:0] ffn_weight_mant;
+
+// 内部寄存版本，便于组合逻辑赋值
+reg  [SIDENET_DIM*EXP_WIDTH-1:0]           ffn_weight_exp_array_reg;
+reg  [SIDENET_DIM*FEATURE_CHUNK*DATA_WIDTH-1:0] ffn_weight_mant_reg;
+
+assign ffn_weight_exp_array = ffn_weight_exp_array_reg;
+assign ffn_weight_mant      = ffn_weight_mant_reg;
+
+// 将统一接口拆分为 W1 / W2 请求，连到 weight_controller
+assign ffn_w1_weight_req = ffn_weight_req && (ffn_weight_type == 2'd0);
+assign ffn_w2_weight_req = ffn_weight_req && (ffn_weight_type == 2'd1);
+
+// 将 W1 / W2 ready 合成一个统一的 ready
+assign ffn_weight_ready =
+    ((ffn_weight_type == 2'd0) && ffn_w1_weight_ready) ||
+    ((ffn_weight_type == 2'd1) && ffn_w2_weight_ready);
+
+// W1 / W2 chunk 选择常数
+localparam integer FFN_W1_CHUNK_MANT_BITS = SIDENET_DIM * FEATURE_CHUNK * DATA_WIDTH;
+
+// 组合逻辑：根据 type / chunk_id，从 W1/W2 完整矩阵中抽取对应 8×8 block
+integer ffn_row_idx;
+integer ffn_feat_idx;
+integer ffn_src_exp_idx;
+integer ffn_src_row_idx;
+integer ffn_dest_index;
+integer ffn_src_index;
+integer base_mant_bit;
+
+always @(*) begin
+    // 默认清零
+    ffn_weight_exp_array_reg = {SIDENET_DIM*EXP_WIDTH{1'b0}};
+    ffn_weight_mant_reg      = {SIDENET_DIM*FEATURE_CHUNK*DATA_WIDTH{1'b0}};
+    base_mant_bit            = 0;
+    ffn_src_exp_idx          = 0;
+    ffn_src_row_idx          = 0;
+    ffn_dest_index           = 0;
+    ffn_src_index            = 0;
+
+    case (ffn_weight_type)
+        //==============================================================
+        // W1: 8×32
+        //  - 指数：32 个，按列组织，这里按 chunk 切成 4 组，每组 8 个
+        //  - 尾数：按列优先展开，每列 8 个元素
+        //==============================================================
+        2'd0: begin
+            // 指数：第 chunk_id 组的 8 个指数
+            for (ffn_row_idx = 0; ffn_row_idx < SIDENET_DIM; ffn_row_idx = ffn_row_idx + 1) begin
+                ffn_src_exp_idx = ffn_weight_chunk_id*SIDENET_DIM + ffn_row_idx;   // 0~31
+                ffn_weight_exp_array_reg[ffn_row_idx*EXP_WIDTH +: EXP_WIDTH] =
+                    ffn_w1_weight_exp_array[ffn_src_exp_idx*EXP_WIDTH +: EXP_WIDTH];
+            end
+
+            // 尾数：整块切片 (一个 chunk 是连续 8×8=64 个权重)
+            base_mant_bit = ffn_weight_chunk_id * FFN_W1_CHUNK_MANT_BITS;
+            ffn_weight_mant_reg =
+                ffn_w1_weight_mant[base_mant_bit +: FFN_W1_CHUNK_MANT_BITS];
+        end
+
+        //==============================================================
+        // W2: 32×8
+        //  - 指数：8 个，对应 8 个输出维度（列）
+        //  - 尾数：按列优先展开，每列 32 个元素
+        //  - chunk 沿着 32 维隐藏层方向划分，每块 8 行
+        //==============================================================
+        2'd1: begin
+            // 指数：对所有 chunk 相同，直接透传
+            ffn_weight_exp_array_reg = ffn_w2_weight_exp_array;
+
+            // 尾数：为当前 chunk_id / feature 内的每一个 (feature, dim) 选取对应元素
+            for (ffn_feat_idx = 0; ffn_feat_idx < FEATURE_CHUNK; ffn_feat_idx = ffn_feat_idx + 1) begin
+                ffn_src_row_idx = ffn_weight_chunk_id*FEATURE_CHUNK + ffn_feat_idx; // 0~31
+
+                for (ffn_row_idx = 0; ffn_row_idx < SIDENET_DIM; ffn_row_idx = ffn_row_idx + 1) begin
+                    // 目标下标：feature 在外层，dim 在内层
+                    ffn_dest_index = (ffn_feat_idx*SIDENET_DIM + ffn_row_idx)*DATA_WIDTH;
+
+                    // 源下标：W2 按列优先展开 -> 索引 = 列*32 + 行
+                    ffn_src_index  = (ffn_row_idx*D_FF + ffn_src_row_idx)*DATA_WIDTH;
+
+                    ffn_weight_mant_reg[ffn_dest_index +: DATA_WIDTH] =
+                        ffn_w2_weight_mant[ffn_src_index +: DATA_WIDTH];
+                end
+            end
+        end
+
+        default: begin
+            // 保持默认 0
+        end
+    endcase
+end
 
 //================================================================================
 // 状态机：协调三个阶段的执行
@@ -305,8 +369,8 @@ always @(*) begin
 end
 
 // 子模块启动信号生成
-assign compress_start = (state == COMPRESSION);
-assign gate_start = (state == GATE);
+assign compress_start    = (state == COMPRESSION);
+assign gate_start        = (state == GATE);
 assign transformer_start = (state == ADAPTATION);
 
 // 顶层控制输出
@@ -472,7 +536,7 @@ sidenet_gated_buffer #(
     .dbg_write_collisions()
 );
 
-//========== 5. Adaptation Transformer (修改 v2.1) ==========
+//========== 5. Adaptation Transformer (修改 v2.1, 适配统一 FFN 接口) ==========
 sidenet_adaptation_transformer #(
     .TOKEN_NUM(TOKEN_NUM),
     .TOKEN_BATCH(TOKEN_BATCH),
@@ -524,16 +588,13 @@ sidenet_adaptation_transformer #(
     .wo_weight_exp_array(wo_weight_exp_array),
     .wo_weight_mant(wo_weight_mant),
     
-    // FFN权重接口（新增 v2.1 - 替代DRAM）
-    .ffn_w1_weight_req(ffn_w1_weight_req),
-    .ffn_w1_weight_ready(ffn_w1_weight_ready),
-    .ffn_w1_weight_exp_array(ffn_w1_weight_exp_array),
-    .ffn_w1_weight_mant(ffn_w1_weight_mant),
-    
-    .ffn_w2_weight_req(ffn_w2_weight_req),
-    .ffn_w2_weight_ready(ffn_w2_weight_ready),
-    .ffn_w2_weight_exp_array(ffn_w2_weight_exp_array),
-    .ffn_w2_weight_mant(ffn_w2_weight_mant),
+    // FFN权重接口（通过weight_controller统一管理）
+    .ffn_weight_req(ffn_weight_req),
+    .ffn_weight_type(ffn_weight_type),
+    .ffn_weight_chunk_id(ffn_weight_chunk_id),
+    .ffn_weight_ready(ffn_weight_ready),
+    .ffn_weight_exp_array(ffn_weight_exp_array),
+    .ffn_weight_mant(ffn_weight_mant),
     
     // LayerNorm参数接口（修改 v2.0）
     .ln_param_req(ln_param_req),
@@ -557,7 +618,7 @@ sidenet_adaptation_transformer #(
 // 调试输出
 //================================================================================
 
-assign dbg_fsm_state = state;
+assign dbg_fsm_state   = state;
 assign dbg_cycle_count = cycle_counter;
 
 endmodule

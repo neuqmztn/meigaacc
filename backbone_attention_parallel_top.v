@@ -1,30 +1,4 @@
 `timescale 1ns / 1ps
-
-//===================================================================================
-// Backbone Attention Parallel Top - 完整的4-Head并行Attention系统
-//
-// 架构特点：
-//   - 三层控制结构：
-//     * L1: Batch Controller（管理21个batch循环 + Output Projection）
-//     * L2: 4× Single Head Engine（各自管理21个chunk循环 + 内部accumulator）
-//     * L3: Output Projection（读取4个head输出并投影）
-//   - 4-Head完全并行，无竞争，无仲裁
-//   - Bank化存储：Q Storage、KV Cache都按head分bank
-//
-// 完整数据流：
-//   Token Buffer → QKV Compute → Q Storage / KV Cache
-//   Q Storage + KV Cache → 4× Single Head Engine (并行，内含Accumulator)
-//   4× Head Engine Accumulator → Output Projection → Result Buffer
-//
-// 性能：
-//   - Batch处理：32个query并行
-//   - Head并行：4个head独立
-//   - 总加速比：~128× vs. 串行单query处理
-//
-
-
-//===================================================================================
-
 module backbone_attention_parallel_top #(
     // ========== Token配置 ==========
     parameter TOKEN_NUM      = 640,
@@ -109,7 +83,7 @@ module backbone_attention_parallel_top #(
     //===========================================================================
     // 调试接口
     //===========================================================================
-    output wire [4:0] dbg_current_batch,
+    output wire [6:0] dbg_current_batch,
     output wire [3:0] dbg_batch_ctrl_state,
     output wire [3:0] dbg_heads_done,
     output wire [3:0] dbg_heads_busy,
@@ -185,7 +159,7 @@ wire [(NUM_HEADS*TOKEN_BATCH*EXP_WIDTH)-1:0] q_batch_exp_flat;
 wire [(NUM_HEADS*TOKEN_BATCH*HEAD_DIM*DATA_WIDTH)-1:0] q_batch_mant_flat;
 
 //===================================================================================
-// 内部信号：KV Cache → Head Engines（包含valid信号）
+// 内部信号：KV Cache → Head Engines
 //===================================================================================
 // K读取信号
 wire [NUM_HEADS-1:0] k_rd_en;
@@ -214,7 +188,7 @@ wire [NUM_HEADS-1:0] accum_rd_valid;
 //===================================================================================
 // 内部信号：调试
 //===================================================================================
-wire [4:0] current_batch;
+wire [6:0] current_batch;
 wire first_batch_flag;
 wire [3:0] batch_ctrl_state;
 wire [31:0] batch_cycle_count_internal;
@@ -242,7 +216,7 @@ assign dbg_kv_cache_ready = kv_cache_ready;
 assign dbg_kv_cache_status = kv_cache_status;
 
 //===================================================================================
-// 模块实例化 1: Batch Controller（顶层控制器）
+//  1: Batch Controller（顶层控制器）
 //===================================================================================
 attention_batch_controller #(
     .NUM_BATCHES(NUM_BATCHES),
@@ -286,7 +260,7 @@ attention_batch_controller #(
 );
 
 //===================================================================================
-// 模块实例化 2: QKV Compute Engine
+// 2: QKV Compute Engine
 //===================================================================================
 qkv_compute_engine #(
     .TOKEN_NUM(TOKEN_NUM),
@@ -348,11 +322,12 @@ qkv_compute_engine #(
     .kv_wr_mant(kv_cache_wr_mant),
     
     // 状态输出
-    .all_kv_written()
+    .all_kv_written(),
+    .error()
 );
 
 //===================================================================================
-// 模块实例化 3: Q Matrix Storage（4-Bank并行）
+// 3: Q Matrix Storage（4-Bank并行）
 //===================================================================================
 q_matrix_storage #(
     .NUM_HEADS(NUM_HEADS),
@@ -371,7 +346,7 @@ q_matrix_storage #(
     .wr_exp(q_storage_wr_exp),
     .wr_mant_packed(q_storage_wr_mant),
     
-    // ✅ 4个并行读接口 - 使用packed array
+    //  4个并行读接口 
     .rd_en_h0(q_rd_en[0]),
     .rd_batch_exp_h0(q_batch_exp_flat[0*(TOKEN_BATCH*EXP_WIDTH) +: (TOKEN_BATCH*EXP_WIDTH)]),
     .rd_batch_mant_h0(q_batch_mant_flat[0*(TOKEN_BATCH*HEAD_DIM*DATA_WIDTH) +: (TOKEN_BATCH*HEAD_DIM*DATA_WIDTH)]),
@@ -390,7 +365,7 @@ q_matrix_storage #(
 );
 
 //===================================================================================
-// ✅ 模块实例化 4: KV Cache Manager（连接所有valid信号）
+//4: KV Cache Manager（连接所有valid信号）
 //===================================================================================
 kv_cache_manager #(
     .NUM_HEADS(NUM_HEADS),
@@ -411,8 +386,7 @@ kv_cache_manager #(
     .wr_token(kv_cache_wr_token),
     .wr_exp(kv_cache_wr_exp),
     .wr_mant_packed(kv_cache_wr_mant),
-    
-    // ✅ Head 0 K/V读取 - 使用packed array
+
     .k_rd_en_h0(k_rd_en[0]),
     .k_rd_chunk_h0(k_rd_chunk_flat[0*5 +: 5]),
     .k_rd_valid_h0(k_rd_valid[0]),
@@ -424,8 +398,7 @@ kv_cache_manager #(
     .v_rd_valid_h0(v_rd_valid[0]),
     .v_chunk_exp_h0(v_chunk_exp_flat[0*(CHUNK_SIZE*EXP_WIDTH) +: (CHUNK_SIZE*EXP_WIDTH)]),
     .v_chunk_mant_h0(v_chunk_mant_flat[0*(CHUNK_SIZE*HEAD_DIM*DATA_WIDTH) +: (CHUNK_SIZE*HEAD_DIM*DATA_WIDTH)]),
-    
-    // ✅ Head 1 K/V读取 - 使用packed array
+ 
     .k_rd_en_h1(k_rd_en[1]),
     .k_rd_chunk_h1(k_rd_chunk_flat[1*5 +: 5]),
     .k_rd_valid_h1(k_rd_valid[1]),
@@ -437,8 +410,7 @@ kv_cache_manager #(
     .v_rd_valid_h1(v_rd_valid[1]),
     .v_chunk_exp_h1(v_chunk_exp_flat[1*(CHUNK_SIZE*EXP_WIDTH) +: (CHUNK_SIZE*EXP_WIDTH)]),
     .v_chunk_mant_h1(v_chunk_mant_flat[1*(CHUNK_SIZE*HEAD_DIM*DATA_WIDTH) +: (CHUNK_SIZE*HEAD_DIM*DATA_WIDTH)]),
-    
-    // ✅ Head 2 K/V读取 - 使用packed array
+
     .k_rd_en_h2(k_rd_en[2]),
     .k_rd_chunk_h2(k_rd_chunk_flat[2*5 +: 5]),
     .k_rd_valid_h2(k_rd_valid[2]),
@@ -450,8 +422,7 @@ kv_cache_manager #(
     .v_rd_valid_h2(v_rd_valid[2]),
     .v_chunk_exp_h2(v_chunk_exp_flat[2*(CHUNK_SIZE*EXP_WIDTH) +: (CHUNK_SIZE*EXP_WIDTH)]),
     .v_chunk_mant_h2(v_chunk_mant_flat[2*(CHUNK_SIZE*HEAD_DIM*DATA_WIDTH) +: (CHUNK_SIZE*HEAD_DIM*DATA_WIDTH)]),
-    
-    // ✅ Head 3 K/V读取 - 使用packed array
+
     .k_rd_en_h3(k_rd_en[3]),
     .k_rd_chunk_h3(k_rd_chunk_flat[3*5 +: 5]),
     .k_rd_valid_h3(k_rd_valid[3]),
@@ -470,7 +441,7 @@ kv_cache_manager #(
 );
 
 //===================================================================================
-// ✅ 模块实例化 5: 4个并行的Single Head Engine（使用valid信号）
+//5: 4个并行的Single Head Engine（使用valid信号）
 //===================================================================================
 genvar h;
 generate
@@ -537,7 +508,7 @@ generate
 endgenerate
 
 //===================================================================================
-// 模块实例化 6: Output Projection
+// 6: Output Projection
 //===================================================================================
 output_projection #(
     .NUM_HEADS(NUM_HEADS),
@@ -562,31 +533,27 @@ output_projection #(
     .done(output_proj_done),
     .busy(output_proj_busy),
     
-    // ✅ Head 0 Accumulator读取 - 使用packed array的位选择
     .accum_rd_en_h0(accum_rd_en[0]),
     .accum_rd_row_h0(accum_rd_row_flat[0*5 +: 5]),
     .accum_rd_dim_h0(accum_rd_dim_flat[0*3 +: 3]),
     .accum_rd_mant_h0(accum_rd_mant_flat[0*ACCUM_WIDTH +: ACCUM_WIDTH]),
     .accum_rd_exp_h0(accum_rd_exp_flat[0*EXP_WIDTH +: EXP_WIDTH]),
     .accum_rd_valid_h0(accum_rd_valid[0]),
-    
-    // ✅ Head 1 Accumulator读取 - 使用packed array的位选择
+
     .accum_rd_en_h1(accum_rd_en[1]),
     .accum_rd_row_h1(accum_rd_row_flat[1*5 +: 5]),
     .accum_rd_dim_h1(accum_rd_dim_flat[1*3 +: 3]),
     .accum_rd_mant_h1(accum_rd_mant_flat[1*ACCUM_WIDTH +: ACCUM_WIDTH]),
     .accum_rd_exp_h1(accum_rd_exp_flat[1*EXP_WIDTH +: EXP_WIDTH]),
     .accum_rd_valid_h1(accum_rd_valid[1]),
-    
-    // ✅ Head 2 Accumulator读取 - 使用packed array的位选择
+
     .accum_rd_en_h2(accum_rd_en[2]),
     .accum_rd_row_h2(accum_rd_row_flat[2*5 +: 5]),
     .accum_rd_dim_h2(accum_rd_dim_flat[2*3 +: 3]),
     .accum_rd_mant_h2(accum_rd_mant_flat[2*ACCUM_WIDTH +: ACCUM_WIDTH]),
     .accum_rd_exp_h2(accum_rd_exp_flat[2*EXP_WIDTH +: EXP_WIDTH]),
     .accum_rd_valid_h2(accum_rd_valid[2]),
-    
-    // ✅ Head 3 Accumulator读取 - 使用packed array的位选择
+
     .accum_rd_en_h3(accum_rd_en[3]),
     .accum_rd_row_h3(accum_rd_row_flat[3*5 +: 5]),
     .accum_rd_dim_h3(accum_rd_dim_flat[3*3 +: 3]),
@@ -610,21 +577,6 @@ output_projection #(
     .dbg_state(dbg_output_proj_state)
 );
 
-//===================================================================================
-// 初始化信息
-//===================================================================================
-initial begin
-    $display("========================================");
-    $display("Backbone Attention Parallel Top v5.4");
-    $display("========================================");
-    $display("Key improvements:");
-    $display("  ✅ Fixed synthesis errors by converting unpacked to packed arrays");
-    $display("  ✅ All array indices resolved at compile time");
-    $display("  ✅ KV Cache valid signals connected");
-    $display("  ✅ Head Engines use valid for handshake");
-    $display("  ✅ Robust variable-latency support");
-    $display("  ✅ Industry-standard flow control");
-    $display("========================================");
-end
+
 
 endmodule

@@ -1,23 +1,18 @@
 `timescale 1ns / 1ps
 
 module booth_encoder_universal (
-    input  wire [7:0] multiplicand,   // 实际是 multiplier，那就保持名字不改了
-    input  wire       unsigned_mode,  // 0=有符号, 1=无符号
-    output wire [14:0] k_packed       // 5 组编码 × 3bit = 15bit
+    input  wire [7:0] multiplicand,   
+    input  wire       unsigned_mode,  
+    output wire [14:0] k_packed      
 );
 
-    //--------------------------------------------------------------
-    // 1. 按模式扩展到 11 位：{两位符号/0, 原始8位, 末位补0}
-    //--------------------------------------------------------------
+
     wire [10:0] B_ext;
 
     assign B_ext = unsigned_mode ?
                    {2'b00,      multiplicand, 1'b0} :
                    {multiplicand[7], multiplicand[7], multiplicand, 1'b0};
 
-    //--------------------------------------------------------------
-    // 2. 生成 5 个 3bit 窗口（Radix-4）
-    //--------------------------------------------------------------
     wire [2:0] window [0:4];
 
     assign window[0] = B_ext[ 2: 0];  // bit [2:0]
@@ -26,9 +21,7 @@ module booth_encoder_universal (
     assign window[3] = B_ext[ 8: 6];  // bit [8:6]
     assign window[4] = B_ext[10: 8];  // bit [10:8]
 
-    //--------------------------------------------------------------
-    // 3. 每个窗口用统一的 3bit Booth 编码 {sign, sel[1:0]}
-    //--------------------------------------------------------------
+
     wire [2:0] code [0:4];
 
     genvar i;
@@ -46,24 +39,11 @@ module booth_encoder_universal (
 
 endmodule
 
-
-//==============================================================
-// 子模块：3bit Booth 编码（{sign, sel[1:0]}）
-//==============================================================
 module booth_encode_3bits (
     input  wire [2:0] bits,
     output reg  [2:0] code
 );
-    // 编码约定（和你 pp_generator_with_gating 里的一致）：
-    // bits | 意义 | code
-    // 000  |   0  | 000
-    // 001  |  +1  | 001
-    // 010  |  +1  | 001
-    // 011  |  +2  | 010
-    // 100  |  -2  | 110
-    // 101  |  -1  | 101
-    // 110  |  -1  | 101
-    // 111  |   0  | 000
+
     always @(*) begin
         case (bits)
             3'b000: code = 3'b000;

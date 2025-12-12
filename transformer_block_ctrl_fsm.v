@@ -1,31 +1,5 @@
 `timescale 1ns / 1ps
 
-//================================================================================
-// Transformer Block 层内处理控制器 FSM
-//
-// 功能：
-// 协调层内各个处理步骤的执行顺序和数据流
-//
-// 处理流程：
-// 1. LOAD_INPUT    - 从Layer Token Buffer读输入（如果需要）
-// 2. ATTENTION     - 执行Attention计算
-// 3. RESIDUAL_1    - Residual Add 1 (Input + Attention)
-// 4. LAYERNORM_1   - LayerNorm 1 + 暂存到Layer Token Buffer写BANK
-// 5. FFN           - Feed-Forward Network
-// 6. RESIDUAL_2    - Residual Add 2 (LayerNorm1 + FFN)
-// 7. LAYERNORM_2   - LayerNorm 2 + 写入Layer Token Buffer写BANK
-// 8. DONE          - 完成，准备下一层
-//
-// 数据流：
-// - Attention: Layer Token Buffer(读BANK) → Attention → Result Buffer
-// - Residual 1: Layer Token Buffer + Result Buffer → BFP Add → Result Buffer
-// - LayerNorm 1: Result Buffer → LayerNorm → Result Buffer + Layer Token Buffer(写BANK暂存)
-// - FFN: Result Buffer → FFN → Result Buffer  
-// - Residual 2: Layer Token Buffer(写BANK) + Result Buffer → BFP Add → Result Buffer
-// - LayerNorm 2: Result Buffer → LayerNorm → Layer Token Buffer(写BANK最终输出)
-//
-//================================================================================
-
 module transformer_block_ctrl_fsm #(
     parameter TOKEN_NUM    = 641,
     parameter TOKEN_BATCH  = 32,
@@ -99,13 +73,7 @@ module transformer_block_ctrl_fsm #(
     output reg  [ADDR_WIDTH-1:0] result_rd_addr,
     
     output reg  result_wr_req,
-    output reg  [ADDR_WIDTH-1:0] result_wr_addr,
-    
-    //================================================================================
-    // 调试接口
-    //================================================================================
-    output wire [3:0] dbg_state,
-    output reg  [9:0] dbg_token_idx
+    output reg  [ADDR_WIDTH-1:0] result_wr_addr
 );
 
 //================================================================================
@@ -261,7 +229,7 @@ always @(posedge clk or negedge rst_n) begin
         result_wr_req <= 1'b0;
         result_wr_addr <= {ADDR_WIDTH{1'b0}};
         
-        dbg_token_idx <= 10'h0;
+
         
     end else begin
         // 默认值
